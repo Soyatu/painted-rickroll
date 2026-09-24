@@ -1,0 +1,1957 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Painted Rickroll</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0c0910; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+<canvas id="paint" role="img" aria-label="A 15-second looping painting: a man with a tall auburn quiff, a camel trench coat and a microphone does a bouncy side-to-side two-step under a brick arch at night, all made of moving brushstrokes."></canvas>
+<script>
+"use strict";
+// ============================================================
+// Core math helpers
+// ============================================================
+const TAU = Math.PI * 2;
+const DUR = 15.0;                 // length of the piece (s)
+const BPM = 112;                  // 28 beats = exactly 15 s
+const BEAT = 60 / BPM;
+const REDUCED = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smoothstep = (e0, e1, x) => { const t = clamp((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
+const hash = n => { const s = Math.sin(n * 12.9898 + 78.233) * 43758.5453; return s - Math.floor(s); };
+const noise1 = x => { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return lerp(hash(i), hash(i + 1), u) * 2 - 1; };
+function mulberry(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// easing
+function easeInOutBack(t, s) {
+  const c = (s === undefined ? 1.2 : s) * 1.525;
+  t *= 2;
+  if (t < 1) return (t * t * ((c + 1) * t - c)) / 2;
+  t -= 2;
+  return (t * t * ((c + 1) * t + c) + 2) / 2;
+}
+function easeOutBack(t, s) {
+  const c = s === undefined ? 1.70158 : s;
+  t -= 1;
+  return t * t * ((c + 1) * t + c) + 1;
+}
+const easeInOut = t => t * t * (3 - 2 * t);
+
+// ---------- 3D vectors (y up, x = screen right, z = toward camera)
+const V = (x, y, z) => ({ x, y, z });
+const vadd = (a, b) => V(a.x + b.x, a.y + b.y, a.z + b.z);
+const vsub = (a, b) => V(a.x - b.x, a.y - b.y, a.z - b.z);
+const vmul = (a, s) => V(a.x * s, a.y * s, a.z * s);
+const vmad = (a, b, s) => V(a.x + b.x * s, a.y + b.y * s, a.z + b.z * s);
+const vdot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
+const vcross = (a, b) => V(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+const vlen = a => Math.hypot(a.x, a.y, a.z);
+const vnorm = a => { const l = vlen(a) || 1; return V(a.x / l, a.y / l, a.z / l); };
+const vlerp = (a, b, t) => V(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t);
+
+// ---------- 3x3 rotations, row-major. R = Ry(yaw) * Rx(pitch) * Rz(roll)
+// yaw>0 turns the front (+z) toward +x, pitch>0 leans the top toward the camera (nod),
+// roll>0 tilts the top toward screen-left.
+function rotYXZ(yaw, pitch, roll) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cx = Math.cos(pitch), sx = Math.sin(pitch),
+        cz = Math.cos(roll), sz = Math.sin(roll);
+  return [
+    cy * cz + sy * sx * sz, -cy * sz + sy * sx * cz, sy * cx,
+    cx * sz, cx * cz, -sx,
+    -sy * cz + cy * sx * sz, sy * sz + cy * sx * cz, cy * cx
+  ];
+}
+const mv = (m, v) => V(m[0] * v.x + m[1] * v.y + m[2] * v.z, m[3] * v.x + m[4] * v.y + m[5] * v.z, m[6] * v.x + m[7] * v.y + m[8] * v.z);
+function mm(a, b) {
+  const r = new Array(9);
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+    r[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+  return r;
+}
+// origin + R * (x,y,z)
+const xf = (o, R, x, y, z) => V(o.x + R[0] * x + R[1] * y + R[2] * z, o.y + R[3] * x + R[4] * y + R[5] * z, o.z + R[6] * x + R[7] * y + R[8] * z);
+
+// color helpers
+const mixc = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const scalec = (a, k) => [a[0] * k, a[1] * k, a[2] * k];
+// ============================================================
+// WebGL2: stroke renderer (MRT colour + paint height) and composite
+// ============================================================
+const cv = document.getElementById('paint');
+const gl = cv.getContext('webgl2', {
+  antialias: false, alpha: false, depth: false, stencil: false,
+  premultipliedAlpha: false, preserveDrawingBuffer: false, powerPreference: 'high-performance'
+});
+if (!gl) {
+  document.body.innerHTML = '<p style="color:#cbb;font:16px/1.5 Georgia,serif;padding:2em">This painting needs WebGL2 to move.</p>';
+  throw new Error('WebGL2 unavailable');
+}
+const HAS_CBF = !!gl.getExtension('EXT_color_buffer_float');
+cv.addEventListener('webglcontextlost', e => e.preventDefault());
+cv.addEventListener('webglcontextrestored', () => location.reload());
+
+const STROKE_VS = `#version 300 es
+layout(location=0) in vec3 a_pos;
+layout(location=1) in vec2 a_uv;
+layout(location=2) in vec4 a_p;
+layout(location=3) in vec3 a_rev;
+layout(location=4) in vec4 a_col;
+layout(location=5) in vec4 a_col2;
+layout(location=6) in vec4 a_ex;
+uniform vec2 u_res;
+uniform mat4 u_vp;
+uniform float u_world;
+uniform float u_boil;
+uniform float u_jit;
+out vec2 v_uv; flat out vec4 v_p; flat out vec3 v_rev; out vec4 v_col; flat out vec4 v_col2; flat out vec4 v_ex;
+float h11(float n){ return fract(sin(n * 12.9898) * 43758.5453); }
+void main(){
+  if (u_world > 0.5) {
+    vec3 wp = a_pos;
+    float s = a_p.z;
+    wp.xy += (vec2(h11(s * 7.31 + u_boil * 3.17), h11(s * 3.77 + u_boil * 5.3)) - 0.5) * u_jit;
+    gl_Position = u_vp * vec4(wp, 1.0);
+  } else {
+    vec2 c = a_pos.xy / u_res * 2.0 - 1.0;
+    gl_Position = vec4(c.x, -c.y, 0.0, 1.0);
+  }
+  v_uv = a_uv; v_p = vec4(a_p.x, a_p.y, a_p.z + u_boil * 0.3719, a_p.w); v_rev = a_rev; v_col = a_col; v_col2 = a_col2; v_ex = a_ex;
+}`;
+
+const STROKE_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv; flat in vec4 v_p; flat in vec3 v_rev; in vec4 v_col; flat in vec4 v_col2; flat in vec4 v_ex;
+uniform float u_mask;
+uniform float u_time;
+layout(location=0) out vec4 o_col;
+layout(location=1) out vec4 o_hgt;
+float h11(float n){ return fract(sin(n * 12.9898) * 43758.5453); }
+float h21(vec2 p){ vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
+float vn(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h21(i), h21(i + vec2(1,0)), u.x), mix(h21(i + vec2(0,1)), h21(i + vec2(1,1)), u.x), u.y); }
+float ease(float x){ x = clamp(x, 0.0, 1.0); return x * x * (3.0 - 2.0 * x); }
+void main(){
+  float k = v_rev.z;                  // stroke units -> css px
+  float W = max(v_p.y * k, 0.5);      // stroke width, css px
+  float u = v_uv.x * k;               // distance along stroke, css px
+  float Lc = v_p.x * k;
+  float v = v_uv.y;                   // across, -1.15..1.15
+  float av = abs(v);
+  float seed = mod(v_p.z, 97.0), th = v_p.w;
+  float kind = floor(v_ex.z * 255.0 + 0.5);
+  float dry = v_col2.a;
+  float aa = max(fwidth(v), 0.002) * 1.1;
+  float t = clamp(u / max(Lc, 1.0), 0.0, 1.0);
+  float bIn = v_rev.x < -0.5 ? 1.0 : ease((u_time - v_rev.x) / 0.3);
+  float aOut = v_rev.y > 50.0 ? 0.0 : ease((u_time - v_rev.y) / 0.30);
+  float uA = aOut * Lc, uB = bIn * Lc;
+  if (u < uA || u > uB || uB <= uA) discard;
+  float cov, br, streak, bid;
+  if (kind < 0.5) {
+    float nb = clamp(W * 0.3, 4.0, 60.0);
+    float bx = (v * 0.5 + 0.5) * nb;
+    bid = floor(bx);
+    float bs = smoothstep(0.0, 1.0, fract(bx));
+    float b1 = mix(h11(bid * 1.713 + seed * 17.17), h11((bid + 1.0) * 1.713 + seed * 17.17), bs);
+    float b2 = vn(vec2(bx * 0.3, seed * 3.1));
+    streak = vn(vec2(u / (W * 1.4 + 8.0) + seed * 5.3, bx * 0.55 + seed));
+    br = clamp(b1 * 0.32 + b2 * 0.33 + streak * 0.5 - 0.07, 0.0, 1.0);
+    // low-frequency wobble of the outline, plus broken bristle tracks along the edges
+    float side = step(0.0, v);
+    float en = vn(vec2(u / (W * 1.1 + 6.0), seed * 9.1 + side * 7.0));
+    float edge = 1.0 - 0.13 * en - 0.05 * dry;
+    float ez = smoothstep(0.55, 0.97, av);
+    float bl = h21(vec2(bid + seed * 13.0, floor(u / (W * 0.7 + 4.0))));
+    edge -= ez * step(bl, 0.28 + 0.3 * dry) * 0.3;
+    cov = 1.0 - smoothstep(edge - aa, edge + aa, av);
+    float thr = dry * (0.1 + 0.95 * smoothstep(0.35, 1.0, t)) - 0.05;
+    cov *= smoothstep(thr - 0.06, thr + 0.06, br);
+  } else {
+    bid = 0.0;
+    streak = vn(vec2(u / (W + 10.0), seed));
+    br = 0.45 + 0.3 * streak;
+    cov = 1.0 - smoothstep(0.15, 1.05, av);
+    cov *= cov;
+  }
+  float sq = 1.0 - v_ex.w;
+  float capS = max(W * 0.5 * sq, 1.0);
+  float ds = clamp((u - uA) / capS, 0.0, 1.0);
+  float allowS = sqrt(ds * (2.0 - ds));
+  cov *= 1.0 - smoothstep(allowS - aa, allowS + aa, av);
+  float capE = max(W * 0.35 * sq, 1.0);
+  float de = clamp((uB - u) / capE, 0.0, 1.0);
+  float allowE = sqrt(de * (2.0 - de));
+  cov *= 1.0 - smoothstep(allowE - aa, allowE + aa, av);
+  float a = v_col.a * cov;
+  if (a < 0.004) discard;
+  vec3 c;
+  if (u_mask > 0.5) {
+    c = v_col.rgb;
+  } else {
+    float load = mix(h11(bid * 3.31 + seed * 7.7), h11((bid + 1.0) * 3.31 + seed * 7.7), smoothstep(0.2, 0.8, fract((v * 0.5 + 0.5) * clamp(W * 0.3, 4.0, 60.0))));
+    float m2 = smoothstep(0.4, 0.72, load * 0.6 + streak * 0.5);
+    c = mix(v_col.rgb, v_col2.rgb, m2);
+    c *= 0.8 + 0.4 * br;
+    c *= 1.0 + 0.06 * (1.0 - smoothstep(0.0, 0.15, t));
+  }
+  o_col = vec4(c * a, a);
+  float hg = th * (0.22 + 0.78 * br) * (1.0 - 0.45 * dry * smoothstep(0.4, 1.0, t)) + th * 0.45 * smoothstep(0.62, 0.98, av);
+  o_hgt = vec4(hg * a, v_ex.x * a, v_ex.y * a, a);
+}`;
+
+const COMP_VS = `#version 300 es
+void main(){
+  vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
+  gl_Position = vec4(p, 0.0, 1.0);
+}`;
+
+const COMP_FS = `#version 300 es
+precision highp float;
+uniform sampler2D u_bgC, u_bgH, u_fgC, u_fgH, u_sh;
+uniform vec2 u_res;
+uniform float u_dpr;
+uniform vec3 u_amb, u_wCol, u_cCol;
+uniform vec4 u_wPool, u_wPool2, u_cPool, u_cPool2;
+uniform float u_grain;
+uniform float u_relief;
+uniform float u_floorY;
+uniform float u_time;
+out vec4 o;
+float h21(vec2 p){ vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }
+float pool(vec2 p, vec4 P){
+  vec2 d = (p - P.xy) / max(P.zw, vec2(1.0));
+  float r = length(d);
+  return (1.0 - smoothstep(0.2, 1.0, r)) + 0.35 * (1.0 - smoothstep(0.0, 0.45, r));
+}
+float hAt(vec2 uv){ vec4 b = texture(u_bgH, uv); vec4 f = texture(u_fgH, uv); return b.r * (1.0 - f.a) + f.r; }
+void main(){
+  vec2 fc = gl_FragCoord.xy;
+  vec2 uv = fc / u_res;
+  vec2 px = 1.0 / u_res;
+  vec4 bc = texture(u_bgC, uv), bh = texture(u_bgH, uv);
+  vec4 fcol = texture(u_fgC, uv), fh = texture(u_fgH, uv);
+  vec2 sh = texture(u_sh, uv).rg;
+  vec3 ground = vec3(0.05, 0.038, 0.058);
+  vec3 alb = bc.rgb + ground * (1.0 - bc.a);
+  float recv = bh.a > 0.002 ? clamp(bh.g / bh.a, 0.0, 1.0) : 0.0;
+  float wp = max(pool(fc, u_wPool), pool(fc, u_wPool2)) * (1.0 - sh.r);
+  float cp = max(pool(fc, u_cPool), pool(fc, u_cPool2)) * (1.0 - sh.g);
+  vec3 lightC = u_amb + u_wCol * wp + u_cCol * cp;
+  vec3 bg = mix(alb, alb * lightC, recv * bc.a);
+  // wet paving: a rippled reflection of the dancer below his feet
+  float bgGloss = bh.a > 0.002 ? bh.b / bh.a : 0.0;
+  float below = u_floorY - fc.y;
+  if (below > 0.0) {
+    float dd = below / u_res.y;
+    vec2 rp = vec2(fc.x + sin(fc.y * 0.35 / u_dpr + u_time * 5.0) * 2.5 * u_dpr * (0.3 + dd * 6.0), u_floorY + below * 1.1);
+    vec4 rf = texture(u_fgC, rp / u_res);
+    float k = 0.3 * smoothstep(0.45, 0.65, bgGloss) * (1.0 - smoothstep(0.0, 0.22, dd)) * recv;
+    bg = bg * (1.0 - rf.a * k) + rf.rgb * k;
+  }
+  vec3 col = bg * (1.0 - fcol.a) + fcol.rgb;
+  // impasto relief from the paint height field
+  float s = max(u_dpr, 1.0);
+  float hl = hAt(uv - vec2(px.x * s, 0.0)), hr = hAt(uv + vec2(px.x * s, 0.0));
+  float hd = hAt(uv - vec2(0.0, px.y * s)), hu = hAt(uv + vec2(0.0, px.y * s));
+  float hc = bh.r * (1.0 - fh.a) + fh.r;
+  vec2 css = fc / u_dpr;
+  float wv = 1.0 - smoothstep(0.0, 0.25, hc);
+  vec2 weave = vec2(cos(css.x * 1.7) * sin(css.y * 1.7), sin(css.x * 1.7) * cos(css.y * 1.7)) * 0.12 * wv;
+  vec3 n = normalize(vec3((hl - hr) * u_relief + weave.x, (hd - hu) * u_relief + weave.y, 1.0));
+  vec3 L = normalize(vec3(-0.45, 0.55, 0.7));
+  float diff = dot(n, L) - L.z;
+  float gloss = mix(bh.a > 0.002 ? bh.b / bh.a : 0.0, fh.a > 0.002 ? fh.b / fh.a : 0.0, fcol.a);
+  vec3 hv = normalize(L + vec3(0.0, 0.0, 1.0));
+  float spec = pow(max(dot(n, hv), 0.0), 30.0);
+  float lum = dot(col, vec3(0.3, 0.5, 0.2));
+  col *= 1.0 + diff * 0.85;
+  col += spec * (0.03 + 0.2 * gloss) * vec3(1.0, 0.93, 0.82) * (0.35 + 0.65 * smoothstep(0.02, 0.4, lum));
+  // canvas tooth under everything
+  col *= 0.955 + 0.09 * h21(floor(css * 0.5));
+  // grade: cool the darks, warm the lights
+  col = mix(col, col * vec3(0.9, 0.92, 1.12), 1.0 - smoothstep(0.0, 0.35, lum));
+  // vignette and grain
+  vec2 q = uv - 0.5;
+  col *= 1.0 - 0.9 * dot(q * vec2(0.9, 1.15), q * vec2(0.9, 1.15));
+  col += (h21(floor(css) + u_grain) - 0.5) * 0.03;
+  o = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+
+function glShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    console.error(log);
+    throw new Error('shader: ' + log);
+  }
+  return s;
+}
+function glProgram(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, glShader(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, glShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('link: ' + gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i); u[info.name] = gl.getUniformLocation(p, info.name); }
+  return { p, u };
+}
+const PROG_STROKE = glProgram(STROKE_VS, STROKE_FS);
+const PROG_COMP = glProgram(COMP_VS, COMP_FS);
+
+function glTex(w, h, internal, format, type) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+  return t;
+}
+let HEIGHT_FLOAT = HAS_CBF;
+function glTarget(w, h, withHeight) {
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  const color = glTex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+  let height = null;
+  if (withHeight) {
+    height = HEIGHT_FLOAT ? glTex(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT) : glTex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, height, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE && HEIGHT_FLOAT) {
+      gl.deleteTexture(height);
+      HEIGHT_FLOAT = false;
+      height = glTex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, height, 0);
+    }
+  } else {
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { fb, color, height, w, h, withHeight };
+}
+function glFreeTarget(T) {
+  if (!T) return;
+  gl.deleteFramebuffer(T.fb); gl.deleteTexture(T.color); if (T.height) gl.deleteTexture(T.height);
+}
+
+// ---- vertex layout: 15 x 4 bytes = 60 bytes per vertex
+// pos(3f) uv(2f) p(4f: L, W, seed, thickness) rev(3f: in-delay, out-delay, unit->css px) col(4ub) col2(4ub) ex(4ub)
+const VSTRIDE = 15;
+function glMakeStrokeVAO() {
+  const vao = gl.createVertexArray(), vbo = gl.createBuffer(), ibo = gl.createBuffer();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  [[0, 3, gl.FLOAT, false, 0], [1, 2, gl.FLOAT, false, 12], [2, 4, gl.FLOAT, false, 20], [3, 3, gl.FLOAT, false, 36],
+   [4, 4, gl.UNSIGNED_BYTE, true, 48], [5, 4, gl.UNSIGNED_BYTE, true, 52], [6, 4, gl.UNSIGNED_BYTE, true, 56]]
+    .forEach(([loc, n, type, normd, off]) => { gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, type, normd, VSTRIDE * 4, off); });
+  gl.bindVertexArray(null);
+  return { vao, vbo, ibo };
+}
+const emptyVAO = gl.createVertexArray();
+
+let CW = 0, CH = 0, DPR = 1;
+let T_BG = null, T_FG = null, T_SH = null;
+function glResize() {
+  let dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cw = Math.max(1, window.innerWidth || 1280), ch = Math.max(1, window.innerHeight || 800);
+  let w = Math.round(cw * dpr), h = Math.round(ch * dpr);
+  const maxPx = 4.3e6;
+  if (w * h > maxPx) { const k = Math.sqrt(maxPx / (w * h)); w = Math.round(w * k); h = Math.round(h * k); dpr *= k; }
+  if (w === CW && h === CH) return false;
+  CW = w; CH = h; DPR = dpr;
+  cv.width = w; cv.height = h;
+  glFreeTarget(T_BG); glFreeTarget(T_FG); glFreeTarget(T_SH);
+  T_BG = glTarget(w, h, true); T_BG.name = 'BG';
+  T_FG = glTarget(w, h, true); T_FG.name = 'FG';
+  T_SH = glTarget(Math.ceil(w / 2), Math.ceil(h / 2), false); T_SH.name = 'SH';
+  return true;
+}
+
+// opts: {mask, world, vp, boil, jit, noClear, time, upload}
+function glDrawStrokes(buf, T, opts) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T.fb);
+  gl.viewport(0, 0, T.w, T.h);
+  gl.disable(gl.BLEND);
+  if (!opts.noClear) {
+    gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]);
+    if (T.withHeight) gl.clearBufferfv(gl.COLOR, 1, [0, 0, 0, 0]);
+  }
+  if (buf.ni === 0) return;
+  const P = PROG_STROKE, u = P.u;
+  gl.useProgram(P.p);
+  gl.uniform2f(u.u_res, CW, CH);
+  gl.uniform1f(u.u_mask, opts.mask ? 1 : 0);
+  gl.uniform1f(u.u_world, opts.world ? 1 : 0);
+  gl.uniform1f(u.u_boil, opts.boil || 0);
+  gl.uniform1f(u.u_jit, opts.jit || 0);
+  gl.uniform1f(u.u_time, opts.time || 0);
+  if (opts.vp) gl.uniformMatrix4fv(u.u_vp, false, opts.vp);
+  gl.enable(gl.BLEND);
+  if (opts.mask) { gl.blendEquation(gl.MAX); }
+  else { gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); }
+  gl.bindVertexArray(buf.vao);
+  if (buf.dirty) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf.vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(buf.ab, 0, buf.nv * VSTRIDE * 4), buf.static ? gl.STATIC_DRAW : gl.DYNAMIC_DRAW);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, buf.idx.subarray(0, buf.ni), buf.static ? gl.STATIC_DRAW : gl.DYNAMIC_DRAW);
+    buf.dirty = false;
+  }
+  gl.drawElements(gl.TRIANGLES, buf.ni, gl.UNSIGNED_INT, 0);
+  gl.bindVertexArray(null);
+  gl.disable(gl.BLEND);
+  gl.blendEquation(gl.FUNC_ADD);
+}
+
+function glComposite(U) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, CW, CH);
+  gl.useProgram(PROG_COMP.p);
+  const u = PROG_COMP.u;
+  const texs = [[T_BG.color, 'u_bgC'], [T_BG.height, 'u_bgH'], [T_FG.color, 'u_fgC'], [T_FG.height, 'u_fgH'], [T_SH.color, 'u_sh']];
+  texs.forEach(([tex, name], i) => { gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(u[name], i); });
+  gl.uniform2f(u.u_res, CW, CH);
+  gl.uniform1f(u.u_dpr, DPR);
+  gl.uniform3fv(u.u_amb, U.amb);
+  gl.uniform3fv(u.u_wCol, U.wCol);
+  gl.uniform3fv(u.u_cCol, U.cCol);
+  gl.uniform4fv(u.u_wPool, U.wPool);
+  gl.uniform4fv(u.u_wPool2, U.wPool2);
+  gl.uniform4fv(u.u_cPool, U.cPool);
+  gl.uniform4fv(u.u_cPool2, U.cPool2);
+  gl.uniform1f(u.u_grain, U.grain);
+  gl.uniform1f(u.u_relief, U.relief);
+  gl.uniform1f(u.u_floorY, U.floorY);
+  gl.uniform1f(u.u_time, U.time);
+  gl.bindVertexArray(emptyVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindVertexArray(null);
+}
+// ============================================================
+// Brush strokes -> ribbon geometry
+//  * screen strokes: built every frame in device pixels (the dancer, the shadows)
+//  * world strokes: built once on the wall / floor planes and projected on the GPU
+// ============================================================
+class StrokeBuf {
+  constructor(isStatic) {
+    this.vcap = 1 << 14; this.icap = 1 << 15;
+    this.ab = new ArrayBuffer(this.vcap * VSTRIDE * 4);
+    this.f = new Float32Array(this.ab); this.u = new Uint32Array(this.ab);
+    this.idx = new Uint32Array(this.icap);
+    this.nv = 0; this.ni = 0; this.count = 0;
+    this.static = !!isStatic; this.dirty = true;
+    Object.assign(this, glMakeStrokeVAO());
+  }
+  reset() { this.nv = 0; this.ni = 0; this.count = 0; this.dirty = true; }
+  ensure(nv, ni) {
+    if (this.nv + nv > this.vcap) {
+      const oldU = this.u;
+      this.vcap = Math.max(this.vcap * 2, this.nv + nv + 1024);
+      this.ab = new ArrayBuffer(this.vcap * VSTRIDE * 4);
+      this.f = new Float32Array(this.ab); this.u = new Uint32Array(this.ab);
+      this.u.set(oldU.subarray(0, this.nv * VSTRIDE));
+    }
+    if (this.ni + ni > this.icap) {
+      const old = this.idx;
+      this.icap = Math.max(this.icap * 2, this.ni + ni + 2048);
+      this.idx = new Uint32Array(this.icap);
+      this.idx.set(old.subarray(0, this.ni));
+    }
+  }
+}
+
+// Global render state shared by all painting code
+const G = {
+  t: 0, b: 0, buf: null, mode: 'paint', layer: 'fg', proj: null,
+  maskCol: [1, 0, 0], boil: 0, fgCount: 220,
+  wDir: V(0, 0, 1), cDir: V(0, 0, 1), wI: 1, cI: 1,
+  cam: null, jit: 0.9,
+  rev: null
+};
+const UNIT_WORLD = 3.0;   // css px per cm used for brush texture scale on world strokes
+
+function pack4(r, g, b, a) {
+  return ((clamp(r, 0, 1) * 255 + 0.5) | 0) | (((clamp(g, 0, 1) * 255 + 0.5) | 0) << 8) |
+         (((clamp(b, 0, 1) * 255 + 0.5) | 0) << 16) | (((clamp(a, 0, 1) * 255 + 0.5) | 0) << 24);
+}
+
+const EXT = 1.15;
+let SP = { x: new Float32Array(4096), y: new Float32Array(4096), z: new Float32Array(4096), w: new Float32Array(4096),
+           r: new Float32Array(4096), g: new Float32Array(4096), b: new Float32Array(4096),
+           a: new Float32Array(4096), l: new Float32Array(4096) };
+const JX = new Float32Array(512), JY = new Float32Array(512);
+function growSP(n) {
+  if (n < SP.x.length) return;
+  const m = n * 2;
+  for (const k in SP) { const o = SP[k]; SP[k] = new Float32Array(m); SP[k].set(o); }
+}
+function strokeDefaults(o) {
+  return {
+    w0: o.w0 !== undefined ? o.w0 : 0.62, tS: o.tS !== undefined ? o.tS : 0.14,
+    tE: o.tE !== undefined ? o.tE : 0.34, tip: o.tip !== undefined ? o.tip : 0.28,
+    dry: o.dry !== undefined ? o.dry : 0.35, h: o.h !== undefined ? o.h : 0.35,
+    kind: o.kind || 0, recv: o.recv || 0, gloss: o.gloss !== undefined ? o.gloss : 0.25, sq: o.sq || 0
+  };
+}
+
+// Write m sampled points (SP arrays, x/y[/z]) as a ribbon. perp(i) gives the side vector.
+function emitRibbon(B, m, L, Wmax, seed, rev, unit, o, c2, world, planeN) {
+  const d = strokeDefaults(o);
+  const pc2 = pack4(c2[0], c2[1], c2[2], d.dry);
+  const pex = pack4(d.recv, d.gloss, d.kind / 255, d.sq);
+  const alphaMul = o.a !== undefined ? o.a : 1;
+  B.ensure(m * 2, (m - 1) * 6);
+  const F = B.f, U = B.u;
+  let vi = B.nv;
+  const base = vi;
+  let pnx = 0, pny = 1, pnz = 0;
+  for (let i = 0; i < m; i++) {
+    const i0 = i === 0 ? 0 : i - 1, i1 = i === m - 1 ? m - 1 : i + 1;
+    let tx = SP.x[i1] - SP.x[i0], ty = SP.y[i1] - SP.y[i0], tz = world ? SP.z[i1] - SP.z[i0] : 0;
+    let nx, ny, nz;
+    if (world) { // side = tangent x plane normal
+      nx = ty * planeN.z - tz * planeN.y; ny = tz * planeN.x - tx * planeN.z; nz = tx * planeN.y - ty * planeN.x;
+    } else { nx = -ty; ny = tx; nz = 0; }
+    const nl = Math.hypot(nx, ny, nz);
+    if (nl < 1e-6) { nx = pnx; ny = pny; nz = pnz; } else { nx /= nl; ny /= nl; nz /= nl; }
+    pnx = nx; pny = ny; pnz = nz;
+    const s = SP.l[i] / L;
+    const prof = (d.w0 + (1 - d.w0) * smoothstep(0, d.tS, s)) * (1 - (1 - d.tip) * smoothstep(1 - d.tE, 1, s));
+    const hw = Math.max(world ? 0.2 : 0.7, SP.w[i] * prof) * 0.5 * EXT;
+    const pc = pack4(SP.r[i], SP.g[i], SP.b[i], SP.a[i] * alphaMul);
+    for (let side = -1; side <= 1; side += 2) {
+      const q = vi * VSTRIDE;
+      F[q] = SP.x[i] + nx * hw * side; F[q + 1] = SP.y[i] + ny * hw * side; F[q + 2] = world ? SP.z[i] + nz * hw * side : 0;
+      F[q + 3] = SP.l[i]; F[q + 4] = side * EXT;
+      F[q + 5] = L; F[q + 6] = Wmax; F[q + 7] = seed; F[q + 8] = d.h;
+      F[q + 9] = rev[0]; F[q + 10] = rev[1]; F[q + 11] = unit;
+      U[q + 12] = pc; U[q + 13] = pc2; U[q + 14] = pex;
+      vi++;
+    }
+  }
+  const I = B.idx;
+  let ii = B.ni;
+  for (let i = 0; i < m - 1; i++) {
+    const a = base + i * 2;
+    I[ii++] = a; I[ii++] = a + 1; I[ii++] = a + 2;
+    I[ii++] = a + 1; I[ii++] = a + 3; I[ii++] = a + 2;
+  }
+  B.nv = vi; B.ni = ii; B.dirty = true;
+}
+
+function catmull(p0, p1, p2, p3, t) {
+  const t2 = t * t, t3 = t2 * t;
+  return 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+}
+
+// ctrl: [{x, y, w, c:[r,g,b], a?}] in device pixels.
+function strokeScreen(ctrl, o) {
+  const n = ctrl.length;
+  if (n === 0) return;
+  const B = G.buf;
+  const idx = B.count++;
+  if (n === 1) {
+    const p = ctrl[0];
+    const ang = o.ang !== undefined ? o.ang : hash(idx * 3.7) * Math.PI;
+    const len = (o.len !== undefined ? o.len : p.w * 0.7) * 0.5;
+    const dx = Math.cos(ang) * len, dy = Math.sin(ang) * len;
+    ctrl = [{ x: p.x - dx, y: p.y - dy, w: p.w, c: p.c, a: p.a }, { x: p.x + dx, y: p.y + dy, w: p.w, c: p.c, a: p.a }];
+  }
+  strokeScreenN(ctrl, o, idx);
+}
+
+function strokeScreenN(ctrl, o, idx) {
+  const n = ctrl.length;
+  let minx = 1e9, maxx = -1e9, miny = 1e9, maxy = -1e9, wmax = 0;
+  for (let i = 0; i < n; i++) {
+    const p = ctrl[i];
+    if (p.x < minx) minx = p.x; if (p.x > maxx) maxx = p.x;
+    if (p.y < miny) miny = p.y; if (p.y > maxy) maxy = p.y;
+    if (p.w > wmax) wmax = p.w;
+  }
+  const pad = wmax + 4;
+  if (maxx < -pad || minx > CW + pad || maxy < -pad || miny > CH + pad) return;
+  const rev = G.rev ? G.rev(idx, (minx + maxx) * 0.5) : [-1, 99];
+
+  const jit = (o.jit !== undefined ? o.jit : G.jit) * DPR;
+  const seedBase = o.seed !== undefined ? o.seed : idx * 1.618;
+  const boil = o.still ? 0 : G.boil;
+  for (let i = 0; i < n; i++) {
+    const k = seedBase * 7.31 + i * 1.97 + boil * 3.17;
+    JX[i] = jit ? (hash(k) - 0.5) * 2 * jit : 0;
+    JY[i] = jit ? (hash(k + 11.3) - 0.5) * 2 * jit : 0;
+  }
+  let m = 0;
+  const step = 5 * DPR;
+  growSP(n * 44 + 8);
+  for (let i = 0; i < n - 1; i++) {
+    const i0 = i > 0 ? i - 1 : 0, i3 = i + 2 < n ? i + 2 : n - 1;
+    const p0 = ctrl[i0], p1 = ctrl[i], p2 = ctrl[i + 1], p3 = ctrl[i3];
+    const x0 = p0.x + JX[i0], y0 = p0.y + JY[i0], x1 = p1.x + JX[i], y1 = p1.y + JY[i];
+    const x2 = p2.x + JX[i + 1], y2 = p2.y + JY[i + 1], x3 = p3.x + JX[i3], y3 = p3.y + JY[i3];
+    const segs = Math.max(1, Math.min(40, Math.ceil(Math.hypot(x2 - x1, y2 - y1) / step)));
+    const c1 = p1.c, c2 = p2.c, a1 = p1.a !== undefined ? p1.a : 1, a2 = p2.a !== undefined ? p2.a : 1;
+    for (let s = 0; s < segs; s++) {
+      const t = s / segs;
+      SP.x[m] = catmull(x0, x1, x2, x3, t);
+      SP.y[m] = catmull(y0, y1, y2, y3, t);
+      SP.w[m] = p1.w + (p2.w - p1.w) * t;
+      SP.r[m] = c1[0] + (c2[0] - c1[0]) * t; SP.g[m] = c1[1] + (c2[1] - c1[1]) * t; SP.b[m] = c1[2] + (c2[2] - c1[2]) * t;
+      SP.a[m] = a1 + (a2 - a1) * t;
+      m++;
+    }
+  }
+  {
+    const p = ctrl[n - 1];
+    SP.x[m] = p.x + JX[n - 1]; SP.y[m] = p.y + JY[n - 1]; SP.w[m] = p.w;
+    SP.r[m] = p.c[0]; SP.g[m] = p.c[1]; SP.b[m] = p.c[2]; SP.a[m] = p.a !== undefined ? p.a : 1;
+    m++;
+  }
+  SP.l[0] = 0;
+  for (let i = 1; i < m; i++) SP.l[i] = SP.l[i - 1] + Math.hypot(SP.x[i] - SP.x[i - 1], SP.y[i] - SP.y[i - 1]);
+  let L = SP.l[m - 1];
+  if (L < 0.5) { SP.x[m - 1] += 0.5; L = 0.5; SP.l[m - 1] = 0.5; }
+  let c2 = o.c2;
+  if (!c2) { const c = ctrl[0].c; c2 = [c[0] * 1.1 + 0.03, c[1] * 1.03 + 0.01, c[2] * 0.9]; }
+  const seed = (seedBase + boil * 0.3719) % 97.0;
+  if (!o.exact && G.mode !== 'mask') {
+    const kv = 1 + (hash(seedBase * 5.77) - 0.5) * 0.12, kh = (hash(seedBase * 9.13) - 0.5) * 0.05;
+    for (let i = 0; i < m; i++) { SP.r[i] = SP.r[i] * kv + kh; SP.g[i] *= kv; SP.b[i] = SP.b[i] * kv - kh; }
+  }
+  emitRibbon(G.buf, m, L, wmax, seed, rev, 1 / DPR, o, c2, false, null);
+}
+
+// World-space stroke on a plane (planeN = plane normal). pts: V[], widths in cm.
+function strokeWorld(pts, w, col, o, planeN, rev) {
+  const B = G.buf;
+  const idx = B.count++;
+  const n = pts.length;
+  let m = 0;
+  growSP(n * 44 + 8);
+  const cols = Array.isArray(col[0]) ? col : null;
+  for (let i = 0; i < n - 1; i++) {
+    const p0 = pts[i > 0 ? i - 1 : 0], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2 < n ? i + 2 : n - 1];
+    const segs = Math.max(1, Math.min(24, Math.ceil(vlen(vsub(p2, p1)) / 6)));
+    const w1 = typeof w === 'number' ? w : w[i], w2 = typeof w === 'number' ? w : w[i + 1];
+    const c1 = cols ? cols[i] : col, c2 = cols ? cols[i + 1] : col;
+    for (let s = 0; s < segs; s++) {
+      const t = s / segs;
+      SP.x[m] = catmull(p0.x, p1.x, p2.x, p3.x, t);
+      SP.y[m] = catmull(p0.y, p1.y, p2.y, p3.y, t);
+      SP.z[m] = catmull(p0.z, p1.z, p2.z, p3.z, t);
+      SP.w[m] = w1 + (w2 - w1) * t;
+      SP.r[m] = c1[0] + (c2[0] - c1[0]) * t; SP.g[m] = c1[1] + (c2[1] - c1[1]) * t; SP.b[m] = c1[2] + (c2[2] - c1[2]) * t;
+      SP.a[m] = 1;
+      m++;
+    }
+  }
+  const pl = pts[n - 1], cl = cols ? cols[n - 1] : col;
+  SP.x[m] = pl.x; SP.y[m] = pl.y; SP.z[m] = pl.z; SP.w[m] = typeof w === 'number' ? w : w[n - 1];
+  SP.r[m] = cl[0]; SP.g[m] = cl[1]; SP.b[m] = cl[2]; SP.a[m] = 1;
+  m++;
+  SP.l[0] = 0;
+  for (let i = 1; i < m; i++) SP.l[i] = SP.l[i - 1] + Math.hypot(SP.x[i] - SP.x[i - 1], SP.y[i] - SP.y[i - 1], SP.z[i] - SP.z[i - 1]);
+  let L = Math.max(SP.l[m - 1], 0.3);
+  let wmax = 0;
+  for (let i = 0; i < m; i++) if (SP.w[i] > wmax) wmax = SP.w[i];
+  let c2 = o.c2;
+  if (!c2) { const c = cols ? cols[0] : col; c2 = [c[0] * 1.1 + 0.03, c[1] * 1.03 + 0.01, c[2] * 0.9]; }
+  const seed = (idx * 1.618) % 97.0;
+  emitRibbon(B, m, L, wmax, seed, rev, UNIT_WORLD, o, c2, true, planeN);
+}
+
+// ---------- 3D stroke for the dancer: points in world space, widths in cm, projected by G.proj
+// col: [r,g,b] or array of colors per point.  w: number or array per point.
+function st(pts, w, col, o) {
+  o = o || {};
+  const n = pts.length;
+  if (G.mode === 'mask') {
+    if (o.noShadow) { G.buf.count++; return; }
+    const ctrl = [];
+    for (let i = 0; i < n; i++) {
+      const wi = (typeof w === 'number' ? w : w[i]) * 1.05;
+      const q = G.proj(pts[i]);
+      ctrl.push({ x: q.x, y: q.y, w: Math.max(1, wi * q.s), c: G.maskCol });
+      if (i < n - 1) {
+        const w2 = (typeof w === 'number' ? w : w[i + 1]) * 1.05;
+        const qm = G.proj(vlerp(pts[i], pts[i + 1], 0.5));
+        ctrl.push({ x: qm.x, y: qm.y, w: Math.max(1, (wi + w2) * 0.5 * qm.s), c: G.maskCol });
+      }
+    }
+    return strokeScreen(ctrl, { dry: 0.12, w0: 1, tip: 0.85, tS: 0.05, tE: 0.12, kind: 0, jit: 1.2, seed: o.seed, sq: o.sq || 0 });
+  }
+  const ctrl = new Array(n);
+  const perPointCol = Array.isArray(col[0]);
+  for (let i = 0; i < n; i++) {
+    const q = G.proj(pts[i]);
+    ctrl[i] = { x: q.x, y: q.y, w: Math.max(0.8, (typeof w === 'number' ? w : w[i]) * q.s), c: perPointCol ? col[i] : col };
+  }
+  return strokeScreen(ctrl, o);
+}
+// a dab: one point, width w (cm), length len (cm), screen angle ang (radians) or auto
+function dab(p, w, len, col, o) {
+  o = o || {};
+  if (G.mode === 'mask') {
+    if (o.noShadow) { G.buf.count++; return; }
+    const q = G.proj(p);
+    return strokeScreen([{ x: q.x, y: q.y, w: Math.max(1, w * q.s * 1.05), c: G.maskCol }], { len: len * q.s, ang: o.ang, dry: 0.15, w0: 0.9, tip: 0.7, kind: 0, jit: 1 });
+  }
+  const q = G.proj(p);
+  const oo = Object.assign({}, o, { len: len * q.s });
+  return strokeScreen([{ x: q.x, y: q.y, w: Math.max(0.8, w * q.s), c: col }], oo);
+}
+// ============================================================
+// Skeleton: pose parameters -> 3D joints (units: cm, floor at y = 0)
+// "M" = the microphone arm (his right, screen left), "F" = free arm (his left, screen right)
+// ============================================================
+const RIG = {
+  pelvisY: 98, waistLen: 14, chestLen: 24, neckLen: 14,
+  shoulderX: 19, upperArm: 29, foreArm: 26.5,
+  hipX: 9.5, hipY: -4, thigh: 44, shin: 42
+};
+
+function basePose() {
+  return {
+    px: 0, py: -2.5, pz: 0, pyaw: 0, ppitch: 0, proll: 0,
+    cyaw: 0, cpitch: 0.03, croll: 0,
+    hyaw: 0, hpitch: 0, hroll: 0,
+    shM: 0, shF: 0,
+    mX: -20, mY: -30, mZ: 14, mPole: 0,
+    fX: 20, fY: -30, fZ: 14, fPole: 0,
+    fOpen: 0, fPoint: 0, micAim: 0,
+    lfx: -15, lfz: 2, lfy: 0, lheel: 0, lfyaw: -0.22,
+    rfx: 15, rfz: 2, rfy: 0, rheel: 0, rfyaw: 0.22,
+    lkx: -0.3, rkx: 0.3, squash: 0, twirl: 0, twA: 0,
+    mouth: 0, smile: 0.5, brow: 0, blink: 0, wink: 0
+  };
+}
+function lerpPose(a, b, t) {
+  const r = {};
+  for (const k in a) r[k] = a[k] + (b[k] - a[k]) * t;
+  return r;
+}
+
+function ik2(A, T, l1, l2, pole) {
+  const d = vsub(T, A);
+  let dist = vlen(d);
+  const dir = dist > 1e-6 ? vmul(d, 1 / dist) : V(0, -1, 0);
+  dist = clamp(dist, Math.abs(l1 - l2) + 0.5, l1 + l2 - 0.05);
+  const cosA = clamp((l1 * l1 + dist * dist - l2 * l2) / (2 * l1 * dist), -1, 1);
+  const sinA = Math.sqrt(1 - cosA * cosA);
+  let pp = vsub(pole, vmul(dir, vdot(pole, dir)));
+  let pl = vlen(pp);
+  if (pl < 1e-5) { pp = vsub(V(0, 0, 1), vmul(dir, dir.z)); pl = vlen(pp) || 1; }
+  pp = vmul(pp, 1 / pl);
+  const E = vadd(A, vadd(vmul(dir, cosA * l1), vmul(pp, sinA * l1)));
+  return { E, T: vadd(A, vmul(dir, dist)) };
+}
+
+function footPts(x, z, lift, heel, yaw) {
+  const fx = Math.sin(yaw), fz = Math.cos(yaw);
+  return {
+    ankle: V(x - fx * 8, 8.5 + lift + heel * 0.85, z - fz * 8 + heel * 0.2),
+    heel: V(x - fx * 12, 3 + lift + heel, z - fz * 12),
+    ball: V(x + fx * 4, 1.5 + lift, z + fz * 4),
+    toe: V(x + fx * 11, 2.5 + lift, z + fz * 11)
+  };
+}
+
+function solveRig(ps) {
+  const J = {};
+  const pel = V(ps.px, RIG.pelvisY + ps.py, ps.pz);
+  const Rp = rotYXZ(ps.pyaw, ps.ppitch, ps.proll);
+  const Rw = mm(Rp, rotYXZ(ps.cyaw * 0.5, ps.cpitch * 0.5, ps.croll * 0.5));
+  const Rc = mm(Rp, rotYXZ(ps.cyaw, ps.cpitch, ps.croll));
+  J.pelvis = pel; J.Rp = Rp; J.Rw = Rw; J.Rc = Rc;
+  J.waist = xf(pel, Rp, 0, RIG.waistLen, 0);
+  J.chest = xf(J.waist, Rw, 0, RIG.chestLen, 0);
+  J.neck = xf(J.chest, Rc, 0, RIG.neckLen, -1);
+  const Rn = mm(Rc, rotYXZ(ps.hyaw * 0.4, ps.hpitch * 0.4 + 0.04, ps.hroll * 0.4));
+  const Rh = mm(Rc, rotYXZ(ps.hyaw, ps.hpitch, ps.hroll));
+  J.Rh = Rh;
+  J.neckTop = xf(J.neck, Rn, 0, 7, 1.2);
+  J.head = xf(J.neckTop, Rh, 0, 10.5, 0.5);
+  J.shM = xf(J.neck, Rc, -RIG.shoulderX, -3 + ps.shM, -1);
+  J.shF = xf(J.neck, Rc, RIG.shoulderX, -3 + ps.shF, -1);
+  const tM = xf(J.chest, Rc, ps.mX, ps.mY, ps.mZ);
+  const tF = xf(J.chest, Rc, ps.fX, ps.fY, ps.fZ);
+  const poleM = mv(Rc, vnorm(V(-0.85, -0.55, -0.35 + ps.mPole)));
+  const poleF = mv(Rc, vnorm(V(0.85, -0.55, -0.35 + ps.fPole)));
+  let a = ik2(J.shM, tM, RIG.upperArm, RIG.foreArm, poleM); J.elM = a.E; J.wrM = a.T;
+  a = ik2(J.shF, tF, RIG.upperArm, RIG.foreArm, poleF); J.elF = a.E; J.wrF = a.T;
+  J.hipL = xf(pel, Rp, -RIG.hipX, RIG.hipY, 0);
+  J.hipR = xf(pel, Rp, RIG.hipX, RIG.hipY, 0);
+  const fl = footPts(ps.lfx, ps.lfz, ps.lfy, ps.lheel, ps.lfyaw);
+  const fr = footPts(ps.rfx, ps.rfz, ps.rfy, ps.rheel, ps.rfyaw);
+  a = ik2(J.hipL, fl.ankle, RIG.thigh, RIG.shin, V(ps.lkx, 0, 1)); J.knL = a.E; J.anL = a.T; J.footL = fl;
+  a = ik2(J.hipR, fr.ankle, RIG.thigh, RIG.shin, V(ps.rkx, 0, 1)); J.knR = a.E; J.anR = a.T; J.footR = fr;
+  // mouth point (for the microphone to aim at) in head space
+  J.mouth = xf(J.head, Rh, 0, -6.4, 10);
+  J.pose = ps;
+  return J;
+}
+// ============================================================
+// Choreography: 28 beats at 112 BPM = 15 s.
+// The signature move is the side-to-side two-step: weight shifts on every
+// beat, knees dip on the beat, bent arms swing across the belly against the
+// hips, and the free hand keeps opening and closing.
+// ============================================================
+const parity = k => ((k % 2) + 2) % 2;
+
+// -1..1, flips on every beat with anticipation + overshoot ("hits" the beat)
+function sideHit(b, lag, w0, w1, over) {
+  b -= lag || 0;
+  const k = Math.floor(b + 0.5);
+  const d = b - k;
+  const sg = parity(k) === 0 ? 1 : -1;
+  const a0 = w0 === undefined ? 0.32 : w0, a1 = w1 === undefined ? 0.3 : w1;
+  if (d <= -a0) return -sg;
+  if (d >= a1) return sg;
+  return lerp(-sg, sg, easeInOutBack((d + a0) / (a0 + a1), over === undefined ? 1.1 : over));
+}
+// knee dip: 1 exactly on the beat
+const dip = b => Math.pow(0.5 + 0.5 * Math.cos(TAU * b), 2.5);
+const bump = (b, c, w) => Math.exp(-((b - c) * (b - c)) / (2 * w * w));
+
+function twoStep(b, amp, P) {
+  const s = sideHit(b);
+  const sa = sideHit(b, 0.07, 0.3, 0.34, 1.6);
+  const dp = dip(b);
+  P.px = s * 10 * amp;
+  P.py = -3 - dp * 8 * amp;
+  P.proll = s * 0.13 * amp;
+  P.pyaw = s * 0.14 * amp;
+  P.croll = -s * 0.15 * amp;
+  P.cyaw = -sa * 0.26 * amp;
+  P.cpitch = 0.04 + dp * 0.1 * amp;
+  P.hroll = s * 0.1 * amp;
+  P.hpitch = -0.03 + dp * 0.16 * amp;
+  P.hyaw = -sa * 0.12 * amp;
+  const a = -sa;
+  P.mX = -12 + 16 * a * amp; P.mY = -22 + 8 * a * amp - dp * 4; P.mZ = 23 - 3 * Math.abs(a) * amp;
+  P.fX = 12 + 16 * a * amp; P.fY = -22 - 8 * a * amp - dp * 4; P.fZ = 23 - 3 * Math.abs(a) * amp;
+  P.fOpen = smoothstep(-0.25, 0.25, Math.sin(Math.PI * (b + 0.25)));
+  P.lfx = -17; P.rfx = 17;
+  P.lheel = Math.max(0, s) * 8 * amp;
+  P.rheel = Math.max(0, -s) * 8 * amp;
+  P.lkx = lerp(-0.3, 0.9, clamp(s * amp, 0, 1));
+  P.rkx = lerp(0.3, -0.9, clamp(-s * amp, 0, 1));
+  P.shM = Math.max(0, -s) * 2 * amp;
+  P.shF = Math.max(0, s) * 2 * amp;
+  P.smile = 0.9;
+  P.mouth = 0.05 + 0.08 * dp;
+  P.squash = 0.035 * amp;
+  return P;
+}
+
+function sing(b, P) {
+  twoStep(b, 0.6, P);
+  const s = sideHit(b), sa = sideHit(b, 0.1, 0.3, 0.36, 1.8);
+  const dp = dip(b);
+  P.mX = -4 + s * 1.5; P.mY = 15 + dp * 1.5; P.mZ = 17; P.micAim = 1; P.mPole = 0.25;
+  P.fX = 37 + 4 * sa; P.fY = 7 + 7 * sa + 3 * dp; P.fZ = 21 - 5 * sa; P.fOpen = 1; P.fPole = 0.25;
+  P.hpitch = -0.12 + dp * 0.08; P.hroll = -0.07 + s * 0.06; P.hyaw = -0.06;
+  const e = b * 2, k = Math.floor(e), f = e - k;
+  P.mouth = (0.4 + 0.6 * hash(k * 1.37 + 5)) * Math.sin(Math.PI * Math.min(1, f * 1.2));
+  P.brow = 0.6;
+  P.blink = 0.9 * smoothstep(11.3, 11.6, b) * (1 - smoothstep(12.6, 12.9, b));
+  P.smile = 0.35;
+  return P;
+}
+
+function big(b, P) {
+  twoStep(b, 1.3, P);
+  const s = sideHit(b, 0, 0.3, 0.32, 1.4);
+  const sa = sideHit(b, 0.08, 0.3, 0.36, 1.9);
+  const dp = dip(b);
+  const g = (s + 1) / 2;
+  P.px += s * 8;
+  // step-touch: leading foot steps out, trailing foot closes in
+  P.lfx = lerp(-29, 3, g); P.rfx = lerp(-3, 29, g);
+  const arc = Math.sin(Math.PI * clamp(g, 0, 1));
+  P.lfy = arc * 6; P.rfy = arc * 4;
+  const a = -sa;
+  P.mX = -12 + 22 * a; P.mY = -12 + 13 * a - dp * 5; P.mZ = 24;
+  P.fX = 12 + 22 * a; P.fY = -12 - 13 * a - dp * 5; P.fZ = 24;
+  const sh = smoothstep(17.8, 18.2, b) * (1 - smoothstep(19.8, 20.2, b));
+  const wob = Math.sin(TAU * 2 * b);
+  P.shM += sh * 3.5 * wob; P.shF -= sh * 3.5 * wob; P.croll += sh * 0.07 * wob;
+  // mic twirl: he lets the mic out on its cable and whirls it round, one loop per beat
+  const tw = smoothstep(19.8, 20.15, b) * (1 - smoothstep(21.7, 22.05, b));
+  if (tw > 0) {
+    const th = TAU * (b - 20) - Math.PI / 2;
+    P.twirl = tw; P.twA = th;
+    P.mX = lerp(P.mX, -36 + 6 * Math.cos(th + 1.6), tw);
+    P.mY = lerp(P.mY, 16 + 6 * Math.sin(th + 1.6), tw);
+    P.mZ = lerp(P.mZ, 14, tw);
+    P.hyaw = lerp(P.hyaw, -0.25, tw); P.hroll = lerp(P.hroll, 0.12, tw);
+  }
+  P.mouth = 0.06; P.smile = 1;
+  return P;
+}
+
+function pointMove(b, P) {
+  twoStep(b, 0.55, P);
+  const e = easeOutBack(clamp((b - 23.72) / 0.5, 0, 1), 2.2);
+  const dp = dip(b);
+  P.fX = lerp(P.fX, 49, e); P.fY = lerp(P.fY, 15 + dp * 3, e); P.fZ = lerp(P.fZ, 33 + dp * 4, e);
+  P.fPoint = smoothstep(23.75, 24.05, b); P.fOpen = lerp(P.fOpen, 0, e); P.fPole = 0.4 * e;
+  P.mX = lerp(P.mX, -23, e); P.mY = lerp(P.mY, -29, e); P.mZ = lerp(P.mZ, 12, e);
+  P.hroll = lerp(P.hroll, -0.15, e); P.hyaw = lerp(P.hyaw, 0.12, e);
+  P.wink = bump(b, 25.1, 0.3);
+  P.smile = 1; P.brow = 0.7 * e; P.mouth = 0.12;
+  return P;
+}
+
+const SECTIONS = [
+  { b: 0, f: (b, P) => twoStep(b, 0.45, P) },
+  { b: 2, f: (b, P) => twoStep(b, 1.0, P) },
+  { b: 10, f: sing },
+  { b: 14, f: big },
+  { b: 22, f: (b, P) => twoStep(b, 1.0, P) },
+  { b: 24, f: pointMove },
+  { b: 26.6, f: (b, P) => twoStep(b, 0.45, P) }
+];
+
+function danceAt(t) {
+  const b = t / BEAT;
+  let i = 0;
+  while (i + 1 < SECTIONS.length && b >= SECTIONS[i + 1].b) i++;
+  let P = SECTIONS[i].f(b, basePose());
+  const cur = SECTIONS[i].b;
+  if (i > 0 && b < cur + 0.25) {
+    const Q = SECTIONS[i - 1].f(b, basePose());
+    P = lerpPose(Q, P, smoothstep(cur - 0.35, cur + 0.25, b));
+  }
+  if (i + 1 < SECTIONS.length) {
+    const nb = SECTIONS[i + 1].b;
+    if (b > nb - 0.35) {
+      const Q = SECTIONS[i + 1].f(b, basePose());
+      P = lerpPose(P, Q, smoothstep(nb - 0.35, nb + 0.25, b));
+    }
+  }
+  return P;
+}
+// ============================================================
+// Secondary motion: coat skirt, belt ends, mic cable, quiff and mic follow-through.
+// Fixed 120 Hz verlet, deterministic from a pre-roll, so any frame can be reproduced.
+// ============================================================
+const SIM = {
+  dt: 1 / 120, t: 0, ready: false, n: 0,
+  x: new Float64Array(160), y: new Float64Array(160), z: new Float64Array(160),
+  ox: new Float64Array(160), oy: new Float64Array(160), oz: new Float64Array(160), w: new Float64Array(160),
+  cons: [], cols: [], belts: [[], []], cable: [],
+  hair: null, mic: null, trails: {}
+};
+const COAT_COLS = [
+  { x: -8.5, z: 13.5, panel: 0 }, { x: -16, z: 11, panel: 0 }, { x: -22.5, z: 2, panel: 0 },
+  { x: 8.5, z: 13.5, panel: 1 }, { x: 16, z: 11, panel: 1 }, { x: 22.5, z: 2, panel: 1 },
+  { x: -20.5, z: -9, panel: 2 }, { x: -7, z: -13.5, panel: 2 }, { x: 7, z: -13.5, panel: 2 }, { x: 20.5, z: -9, panel: 2 }
+];
+const SKIRT_Y = 12;
+const CABLE_N = 44, CABLE_SEG = 8.2;
+const CABLE_END = V(-265, 0.8, 45);
+const BELT_N = 4, BELT_SEG = 5.8;
+const TRAIL_N = 30;
+
+const modT = t => ((t % DUR) + DUR) % DUR;
+
+function simP(p, pinned) {
+  const i = SIM.n++;
+  SIM.x[i] = SIM.ox[i] = p.x; SIM.y[i] = SIM.oy[i] = p.y; SIM.z[i] = SIM.oz[i] = p.z;
+  SIM.w[i] = pinned ? 0 : 1;
+  return i;
+}
+function simPin(i, p) { SIM.x[i] = SIM.ox[i] = p.x; SIM.y[i] = SIM.oy[i] = p.y; SIM.z[i] = SIM.oz[i] = p.z; }
+function simC(i, j, k, rest) {
+  const r = rest !== undefined ? rest : Math.hypot(SIM.x[j] - SIM.x[i], SIM.y[j] - SIM.y[i], SIM.z[j] - SIM.z[i]);
+  SIM.cons.push([i, j, r, k]);
+}
+const simGet = i => V(SIM.x[i], SIM.y[i], SIM.z[i]);
+
+function micFrame(J, lagDir) {
+  const fore = vnorm(vsub(J.wrM, J.elM));
+  const grip = vmad(J.wrM, fore, 6.5);
+  const up = vnorm(mv(J.Rc, V(0.12, 1, 0.3)));
+  let d = vnorm(vadd(vmul(fore, 0.5), up));
+  const ps = J.pose;
+  if (ps.micAim > 0.001) d = vnorm(vlerp(d, vnorm(vsub(J.mouth, grip)), ps.micAim));
+  if (lagDir) d = lagDir;
+  let head = vmad(grip, d, 12), bottom = vmad(grip, d, -11);
+  const tw = ps.twirl || 0;
+  if (tw > 0.001) {
+    // released on its cable: orbit around the fist in a plane facing the camera
+    const e = smoothstep(0, 1, tw);
+    const u1 = V(-1, 0, 0), u2 = vnorm(V(0, 1, 0.3));
+    const radial = vadd(vmul(u1, Math.cos(ps.twA)), vmul(u2, Math.sin(ps.twA)));
+    const ob = vmad(grip, radial, 36), oh = vmad(ob, radial, 23);
+    bottom = vlerp(bottom, ob, e); head = vlerp(head, oh, e);
+    d = vnorm(vsub(head, bottom));
+    return { grip, d, head, bottom, fore, lasso: e };
+  }
+  return { grip, d, head, bottom, fore, lasso: 0 };
+}
+
+function coatRest(J, c) {
+  const Ry = rotYXZ(J.pose.pyaw, 0, 0);
+  const a = xf(J.pelvis, J.Rp, c.x, SKIRT_Y, c.z);
+  return {
+    a,
+    m: vadd(a, mv(Ry, V(c.x * 0.1, -33, c.z * 0.08))),
+    h: vadd(a, mv(Ry, V(c.x * 0.3, -66.5, c.z * 0.24)))
+  };
+}
+
+function simReset(t0) {
+  SIM.n = 0; SIM.cons = []; SIM.cols = []; SIM.belts = [[], []]; SIM.cable = [];
+  const J = solveRig(danceAt(modT(t0)));
+  for (const c of COAT_COLS) {
+    const r = coatRest(J, c);
+    const col = { x: c.x, z: c.z, panel: c.panel, a: simP(r.a, true), m: simP(r.m, false), h: simP(r.h, false) };
+    SIM.cols.push(col);
+    simC(col.a, col.m, 1); simC(col.m, col.h, 1);
+  }
+  const link = (i, j, k) => { simC(SIM.cols[i].m, SIM.cols[j].m, k); simC(SIM.cols[i].h, SIM.cols[j].h, k); };
+  link(0, 1, 0.6); link(1, 2, 0.6); link(3, 4, 0.6); link(4, 5, 0.6);
+  link(6, 7, 0.6); link(7, 8, 0.6); link(8, 9, 0.6); link(2, 6, 0.35); link(5, 9, 0.35);
+  // belt ends hanging from the side loops
+  for (let s = 0; s < 2; s++) {
+    const sg = s === 0 ? -1 : 1;
+    const a = xf(J.pelvis, J.Rp, sg * 21, 11, -4);
+    const chain = [simP(a, true)];
+    for (let k = 1; k <= BELT_N; k++) { chain.push(simP(V(a.x + sg * 0.5 * k, a.y - BELT_SEG * k, a.z + 1), false)); simC(chain[k - 1], chain[k], 1, BELT_SEG); }
+    SIM.belts[s] = chain;
+  }
+  // microphone cable from the handle to a pin on the floor, off stage left
+  const mf = micFrame(J);
+  const c0 = simP(mf.bottom, true);
+  SIM.cable.push(c0);
+  for (let k = 1; k < CABLE_N; k++) {
+    const t = k / (CABLE_N - 1);
+    const p = vlerp(mf.bottom, CABLE_END, t);
+    p.y = Math.max(0.8, lerp(mf.bottom.y, 0, Math.min(1, t * 3)));
+    const i = simP(p, k === CABLE_N - 1);
+    simC(SIM.cable[k - 1], i, 1, CABLE_SEG);
+    SIM.cable.push(i);
+  }
+  const hairT = xf(J.head, J.Rh, 0, 16, 3);
+  SIM.hair = { p: hairT, v: V(0, 0, 0), off: V(0, 0, 0) };
+  SIM.mic = { p: mf.head, v: V(0, 0, 0), d: mf.d };
+  SIM.trails = { mic: [], free: [], hand: [] };
+  SIM.t = t0; SIM.ready = true;
+}
+
+function pushOut(i, A, B, r) {
+  const X = SIM.x, Y = SIM.y, Z = SIM.z;
+  const abx = B.x - A.x, aby = B.y - A.y, abz = B.z - A.z;
+  const apx = X[i] - A.x, apy = Y[i] - A.y, apz = Z[i] - A.z;
+  const ab2 = abx * abx + aby * aby + abz * abz || 1e-6;
+  const t = clamp((apx * abx + apy * aby + apz * abz) / ab2, 0, 1);
+  const dx = X[i] - (A.x + abx * t), dy = Y[i] - (A.y + aby * t), dz = Z[i] - (A.z + abz * t);
+  const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (d < r && d > 1e-6) { const k = (r - d) / d; X[i] += dx * k; Y[i] += dy * k; Z[i] += dz * k; }
+}
+
+function simStep(T) {
+  const J = solveRig(danceAt(modT(T)));
+  const dt = SIM.dt, X = SIM.x, Y = SIM.y, Z = SIM.z, OX = SIM.ox, OY = SIM.oy, OZ = SIM.oz, W = SIM.w;
+  // pinned anchors
+  const rests = [];
+  for (const c of SIM.cols) { const r = coatRest(J, c); rests.push(r); simPin(c.a, r.a); }
+  for (let s = 0; s < 2; s++) simPin(SIM.belts[s][0], xf(J.pelvis, J.Rp, (s === 0 ? -1 : 1) * 21, 11, -4));
+  // mic follow-through spring
+  const mf0 = micFrame(J);
+  const mic = SIM.mic;
+  const tgt = mf0.head;
+  const km = 1500, cm = 2 * 0.32 * Math.sqrt(km);
+  if (mf0.lasso > 0.001) {
+    mic.p = vmad(mf0.grip, vnorm(vsub(tgt, mf0.grip)), 12); mic.v = V(0, 0, 0); mic.d = mf0.d;
+  } else {
+    mic.v = vadd(mic.v, vmul(vsub(vmul(vsub(tgt, mic.p), km), vmul(mic.v, cm)), dt));
+    mic.p = vmad(mic.p, mic.v, dt);
+    const md = vsub(mic.p, mf0.grip);
+    mic.d = vlen(md) > 1e-3 ? vnorm(md) : mf0.d;
+  }
+  const mf = micFrame(J, mic.d);
+  simPin(SIM.cable[0], mf.lasso > 0.001 ? mf.grip : mf.bottom);
+  // quiff spring (exaggerated bounce)
+  const hair = SIM.hair;
+  const ht = xf(J.head, J.Rh, 0, 16, 3);
+  const kh = 650, ch = 2 * 0.2 * Math.sqrt(kh);
+  hair.v = vadd(hair.v, vmul(vsub(vmul(vsub(ht, hair.p), kh), vmul(hair.v, ch)), dt));
+  hair.p = vmad(hair.p, hair.v, dt);
+  hair.off = vsub(hair.p, ht);
+  // verlet integrate
+  const g = -980 * dt * dt;
+  for (let i = 0; i < SIM.n; i++) {
+    if (!W[i]) continue;
+    const damp = 0.988;
+    const vx = (X[i] - OX[i]) * damp, vy = (Y[i] - OY[i]) * damp, vz = (Z[i] - OZ[i]) * damp;
+    OX[i] = X[i]; OY[i] = Y[i]; OZ[i] = Z[i];
+    X[i] += vx; Y[i] += vy + g; Z[i] += vz;
+  }
+  // coat keeps its flare
+  for (let k = 0; k < SIM.cols.length; k++) {
+    const c = SIM.cols[k], r = rests[k];
+    X[c.m] += (r.m.x - X[c.m]) * 0.03; Y[c.m] += (r.m.y - Y[c.m]) * 0.03; Z[c.m] += (r.m.z - Z[c.m]) * 0.03;
+    X[c.h] += (r.h.x - X[c.h]) * 0.016; Y[c.h] += (r.h.y - Y[c.h]) * 0.016; Z[c.h] += (r.h.z - Z[c.h]) * 0.016;
+  }
+  const legs = [[J.hipL, J.knL, 10.5], [J.knL, J.anL, 8.5], [J.hipR, J.knR, 10.5], [J.knR, J.anR, 8.5], [J.hipL, J.hipR, 12]];
+  for (let it = 0; it < 6; it++) {
+    for (let q = 0; q < SIM.cons.length; q++) {
+      const cc = SIM.cons[q], i = cc[0], j = cc[1];
+      const wi = W[i], wj = W[j], ws = wi + wj;
+      if (!ws) continue;
+      const dx = X[j] - X[i], dy = Y[j] - Y[i], dz = Z[j] - Z[i];
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-6;
+      const diff = (d - cc[2]) / d * cc[3] / ws;
+      X[i] += dx * diff * wi; Y[i] += dy * diff * wi; Z[i] += dz * diff * wi;
+      X[j] -= dx * diff * wj; Y[j] -= dy * diff * wj; Z[j] -= dz * diff * wj;
+    }
+    if (it % 2 === 1) {
+      for (const c of SIM.cols) for (const L of legs) { pushOut(c.m, L[0], L[1], L[2]); pushOut(c.h, L[0], L[1], L[2]); }
+      for (const b of SIM.belts) for (let k = 1; k < b.length; k++) for (const L of legs) pushOut(b[k], L[0], L[1], L[2] - 1);
+    }
+    for (let i = 0; i < SIM.n; i++) if (W[i] && Y[i] < 0.8) {
+      Y[i] = 0.8;
+      X[i] = lerp(X[i], OX[i], 0.35); Z[i] = lerp(Z[i], OZ[i], 0.35);
+    }
+  }
+  // trails for smear strokes
+  const tr = SIM.trails;
+  tr.mic.push(mf.head); if (tr.mic.length > TRAIL_N) tr.mic.shift();
+  const fore = vnorm(vsub(J.wrF, J.elF));
+  tr.free.push(vmad(J.wrF, fore, 7)); if (tr.free.length > TRAIL_N) tr.free.shift();
+  tr.hand.push(mf.grip); if (tr.hand.length > TRAIL_N) tr.hand.shift();
+}
+
+function simAdvance(tAbs) {
+  if (!SIM.ready || tAbs < SIM.t - 1e-6 || tAbs - SIM.t > 2.5) simReset(tAbs - 2.0);
+  let steps = 0;
+  while (SIM.t + SIM.dt <= tAbs + 1e-9 && steps < 800) { simStep(SIM.t + SIM.dt); SIM.t += SIM.dt; steps++; }
+}
+// ============================================================
+// The dancer, painted stroke by stroke from the posed skeleton
+// ============================================================
+const MAT = {
+  coat:   { s: [0.34, 0.23, 0.25], m: [0.72, 0.52, 0.31], l: [0.98, 0.79, 0.51], c: [0.64, 0.56, 0.78], d: [0.23, 0.14, 0.14], h: [1.0, 0.93, 0.72] },
+  lining: { s: [0.13, 0.08, 0.10], m: [0.33, 0.21, 0.17], l: [0.58, 0.38, 0.25], c: [0.33, 0.28, 0.54] },
+  blk:    { s: [0.03, 0.03, 0.05], m: [0.075, 0.07, 0.1], l: [0.2, 0.14, 0.13], c: [0.2, 0.19, 0.42] },
+  skin:   { s: [0.5, 0.27, 0.27], m: [0.83, 0.53, 0.41], l: [0.96, 0.69, 0.53], c: [0.74, 0.55, 0.6] },
+  hair:   { s: [0.31, 0.11, 0.07], m: [0.64, 0.27, 0.11], l: [0.97, 0.61, 0.29], c: [0.58, 0.32, 0.46] },
+  chrome: { s: [0.1, 0.1, 0.13], m: [0.36, 0.37, 0.42], l: [0.74, 0.74, 0.78], c: [0.45, 0.42, 0.75] },
+  shoe:   { s: [0.03, 0.02, 0.03], m: [0.09, 0.065, 0.06], l: [0.26, 0.19, 0.17], c: [0.22, 0.21, 0.42] }
+};
+const mvT = (m, v) => V(m[0] * v.x + m[3] * v.y + m[6] * v.z, m[1] * v.x + m[4] * v.y + m[7] * v.z, m[2] * v.x + m[5] * v.y + m[8] * v.z);
+
+function shade(mat, n, jit) {
+  const dw = vdot(n, G.wDir), dc = vdot(n, G.cDir);
+  const lw = clamp(smoothstep(-0.45, 0.8, dw) * G.wI, 0, 1.25);
+  const lc = smoothstep(0.0, 0.85, dc) * G.cI;
+  let c = mixc(mat.s, mat.m, smoothstep(0.0, 0.5, lw));
+  c = mixc(c, mat.l, smoothstep(0.5, 1.15, lw));
+  c = mixc(c, mat.c, clamp(lc * 0.45 * (1 - 0.6 * smoothstep(0.4, 1.0, lw)), 0, 1));
+  if (jit) c = scalec(c, 1 + jit);
+  return c;
+}
+const rowAt = (r, f) => {
+  if (r.length === 3) return f < 0.5 ? vlerp(r[0], r[1], f * 2) : vlerp(r[1], r[2], (f - 0.5) * 2);
+  const k = clamp(f, 0, 1) * (r.length - 1), i = Math.min(r.length - 2, Math.floor(k));
+  return vlerp(r[i], r[i + 1], k - i);
+};
+const gridAt = (rows, r, f) => {
+  const i = Math.min(rows.length - 2, Math.floor(r));
+  return vlerp(rowAt(rows[i], f), rowAt(rows[i + 1], f), r - i);
+};
+function screenAng(p, q) {
+  const a = G.proj(p), b = G.proj(q);
+  return Math.atan2(b.y - a.y, b.x - a.x);
+}
+function perpToward(dir, toward) {
+  let p = vcross(dir, V(0, 0, 1));
+  if (vlen(p) < 1e-4) p = V(1, 0, 0);
+  p = vnorm(p);
+  return vdot(p, toward) < 0 ? vmul(p, -1) : p;
+}
+
+function coatGrid(J, off) {
+  const Rc = J.Rc;
+  const out = {};
+  const g = i => off ? vadd(simGet(i), off) : simGet(i);
+  for (const sg of [-1, 1]) {
+    const cols = SIM.cols.slice(sg < 0 ? 0 : 3, sg < 0 ? 3 : 6);
+    const sh = sg < 0 ? J.shM : J.shF;
+    out[sg < 0 ? 'L' : 'R'] = [
+      [xf(J.neck, Rc, sg * 6.5, 1, 5.5), xf(J.neck, Rc, sg * 14, 0.5, 3), xf(sh, Rc, sg * 7, 1.5, 0)],
+      [xf(J.chest, Rc, sg * 8.5, 2, 12.5), xf(J.chest, Rc, sg * 15.5, 1, 10.5), xf(J.chest, Rc, sg * 22.5, 0, 1.5)],
+      cols.map(c => g(c.a)),
+      cols.map(c => g(c.m)),
+      cols.map(c => g(c.h))
+    ];
+  }
+  const back = SIM.cols.slice(6, 10);
+  out.B = [back.map(c => g(c.a)), back.map(c => g(c.m)), back.map(c => g(c.h))];
+  return out;
+}
+
+// ---------------------------------------------------------------- parts
+function drawBackPanel(C) {
+  const rows = C.B;
+  const fs = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0];
+  for (let k = 0; k < fs.length; k++) {
+    const f = fs[k];
+    const pts = [rowAt(rows[0], f), rowAt(rows[1], f), rowAt(rows[2], f)];
+    const n = vnorm(V((f - 0.5) * 1.2, -0.1, 1));
+    st(pts, [10, 10.5, 11], shade(MAT.lining, n, (hash(k * 5.3) - 0.5) * 0.1), { dry: 0.35, h: 0.35, tip: 0.55 });
+  }
+  st(rows[2], 2.4, MAT.coat.d, { dry: 0.3, a: 0.9 });
+}
+
+function drawLegs(J) {
+  for (const s of ['L', 'R']) {
+    const sg = s === 'L' ? -1 : 1;
+    const hip = J['hip' + s], kn = J['kn' + s], an = J['an' + s], ft = J['foot' + s];
+    const top = vadd(hip, V(0, 7, 0));
+    const hem = vadd(vlerp(an, ft.ball, 0.4), V(0, -0.6, 1.5));
+    // shoe: instep down to a rounded toe, under the trouser hem
+    const shoe = shade(MAT.shoe, vnorm(V(sg * 0.2, 0.6, 0.8)));
+    st([vadd(an, V(0, -1.5, 0.5)), vadd(ft.ball, V(0, 2.6, 0.5)), vadd(ft.toe, V(0, 1.7, 0))], [8.6, 10.2, 9.4], shoe, { dry: 0.1, h: 0.45, gloss: 0.9, w0: 0.95, tip: 0.9, tE: 0.2 });
+    st([vadd(ft.heel, V(-sg * 1, 1.2, 0)), vadd(ft.ball, V(0, 0.4, 0)), vadd(ft.toe, V(0, 0.6, 0.6))], [8.8, 10.4, 9.2], MAT.shoe.s, { a: 0.9, dry: 0.15, h: 0.3, w0: 0.95, tip: 0.9 });
+    dab(vadd(ft.toe, V(-1.6, 3.1, -0.6)), 1.5, 2.6, [0.44, 0.38, 0.4], { dry: 0.3, gloss: 1, a: 0.65, noShadow: true });
+    // trouser leg down to the hem
+    st([top, hip, kn, an, hem], [17.5, 17, 13.5, 12, 12.6], shade(MAT.blk, vnorm(V(sg * 0.3, 0, 1))), { dry: 0.26, h: 0.32, tip: 0.95, tE: 0.12, sq: 0.6 });
+    const lit = vnorm(V(-1, 0.2, 0.5)), cool = vnorm(V(1, 0.2, 0.5));
+    st([vadd(kn, V(-4.8, 1, 2)), vadd(an, V(-4, 1, 2)), vadd(hem, V(-4.4, 1, 0))], 3.2, shade(MAT.blk, lit), { a: 0.85, dry: 0.5, h: 0.3 });
+    st([vadd(kn, V(4.8, 1, 2)), vadd(an, V(4, 1, 2)), vadd(hem, V(4.4, 1, 0))], 2.4, shade(MAT.blk, cool), { a: 0.8, dry: 0.55, h: 0.3 });
+    st([vadd(kn, V(-3, 3, 5)), vadd(kn, V(0.5, -1, 6)), vadd(kn, V(3, 2, 5))], 1.2, MAT.blk.s, { a: 0.7, dry: 0.4 });
+    st([vadd(hem, V(-5.6, 1.4, -1)), vadd(hem, V(0, 0.4, 1.5)), vadd(hem, V(5.6, 1.4, -1))], 1.8, MAT.blk.s, { a: 0.75, dry: 0.3, noShadow: true });
+  }
+}
+
+function drawBelts(J) {
+  for (let s = 0; s < 2; s++) {
+    const sg = s === 0 ? -1 : 1;
+    const pts = SIM.belts[s].map(simGet);
+    st(pts, [3.8, 3.6, 3.5, 3.4, 3.2], shade(MAT.coat, vnorm(V(sg * 0.5, 0, 0.9)), -0.25), { dry: 0.25, h: 0.45, tip: 0.9, w0: 0.9 });
+    st(pts.slice(1), 0.9, MAT.coat.d, { a: 0.7, dry: 0.4, noShadow: true });
+    const end = pts[pts.length - 1];
+    dab(end, 3.2, 3.6, [0.28, 0.2, 0.12], { dry: 0.2, gloss: 0.8, ang: Math.PI / 2 });
+  }
+}
+
+function drawTorso(J) {
+  const Rc = J.Rc, Rw = J.Rw;
+  const back = mv(Rc, V(0, 0.2, 1));
+  st([xf(J.neck, Rc, -8, 4, -1.5), xf(J.neck, Rc, 0, 6.5, -4.5), xf(J.neck, Rc, 8, 4, -1.5)], 3.6, shade(MAT.coat, back, -0.25), { dry: 0.3 });
+  for (const x of [-5.5, 0, 5.5]) {
+    const pts = [xf(J.neck, Rc, x * 0.7, 2, 5.5), xf(J.chest, Rc, x, 0, 11.5), xf(J.waist, Rw, x * 1.05, 0, 10), xf(J.pelvis, J.Rp, x * 1.1, -6, 9)];
+    st(pts, 8, shade(MAT.blk, mv(Rc, vnorm(V(x / 10, 0.15, 1)))), { dry: 0.32, h: 0.3 });
+  }
+  st([xf(J.chest, Rc, -3, 8, 11), xf(J.chest, Rc, -4.5, -6, 12)], 2, shade(MAT.blk, mv(Rc, vnorm(V(-0.6, 0.4, 0.8)))), { a: 0.7, dry: 0.55 });
+  // neck skin, then the tall black turtleneck collar
+  st([xf(J.neckTop, J.Rh, 0, 2.5, 1.5), xf(J.neck, Rc, 0, 4, 3)], 9.4, shade(MAT.skin, mv(J.Rh, V(0, -0.5, 0.8))), { tip: 0.9, w0: 0.9, dry: 0.15 });
+  st([xf(J.neck, Rc, -6.2, 4.5, 1.5), xf(J.neck, Rc, 0, 3.8, 6.2), xf(J.neck, Rc, 6.2, 4.5, 1.5)], 6.4, shade(MAT.blk, mv(Rc, V(0, 0.3, 1))), { dry: 0.2, h: 0.35 });
+  st([xf(J.neck, Rc, -5.5, 6.8, 2.2), xf(J.neck, Rc, 0, 6.3, 6.3), xf(J.neck, Rc, 5.5, 6.8, 2.2)], 1.4, MAT.blk.l, { a: 0.55, dry: 0.5, noShadow: true });
+}
+
+function drawFrontPanels(J, C) {
+  for (const side of ['L', 'R']) {
+    const sg = side === 'L' ? -1 : 1;
+    const rows = C[side];
+    const wr = r => Math.max(5, Math.abs(rowAt(r, 0).x - rowAt(r, 1).x) + 1.5);
+    const nMid = mv(J.Rc, vnorm(V(sg * 0.5, 0.1, 1)));
+    // flat underpainting so no ground shows through the panel
+    const base = shade(MAT.coat, nMid, -0.12);
+    st([rowAt(rows[0], 0.5), rowAt(rows[1], 0.5), gridAt(rows, 2.3, 0.5)], [wr(rows[0]), wr(rows[1]), wr(rows[2])], base, { dry: 0.05, h: 0.25, w0: 0.95, tip: 0.95, tS: 0.05, tE: 0.08 });
+    const wr3 = r => Math.max(5, vlen(vsub(rowAt(r, 0), rowAt(r, 1))) * 0.85);
+    st([gridAt(rows, 1.8, 0.5), rowAt(rows[3], 0.5), rowAt(rows[4], 0.5)], [wr(rows[2]), wr3(rows[3]), wr3(rows[4])], base, { dry: 0.05, h: 0.25, w0: 0.95, tip: 0.95, tS: 0.05, tE: 0.08 });
+    const fs = [0.08, 0.3, 0.52, 0.74, 0.93];
+    for (let k = 0; k < fs.length; k++) {
+      const f = fs[k];
+      const n = mv(J.Rc, vnorm(V(sg * f * 1.15, 0.15, 1.0 - 0.5 * f)));
+      st([rowAt(rows[0], f), rowAt(rows[1], f), gridAt(rows, 2.25, f)], [8, 9, 9.5],
+        shade(MAT.coat, n, (hash(k * 3.1 + sg) - 0.5) * 0.08), { dry: 0.22, h: 0.45 });
+    }
+    const fl = [0.04, 0.2, 0.36, 0.52, 0.68, 0.84, 0.97];
+    const w3 = Math.max(9, wr3(rows[3]) / 4.2), w4 = Math.max(9.5, wr3(rows[4]) / 4.2);
+    for (let k = 0; k < fl.length; k++) {
+      const f = fl[k];
+      const a = rowAt(rows[3], Math.max(0, f - 0.12)), b = rowAt(rows[3], Math.min(1, f + 0.12));
+      const vt = vsub(rowAt(rows[4], f), rowAt(rows[2], f));
+      let n = vnorm(vcross(vsub(b, a), vt));
+      if (sg > 0) n = vmul(n, -1);
+      const c0 = shade(MAT.coat, n, (hash(k * 7.7 + sg * 3) - 0.5) * 0.1);
+      const c1 = shade(MAT.coat, vnorm(vadd(n, V(0, -0.35, 0))), -0.08);
+      st([gridAt(rows, 1.85, f), rowAt(rows[3], f), rowAt(rows[4], f)], [9.5, w3, w4], [c0, c0, c1], { dry: 0.22, h: 0.45, tip: 0.75 });
+    }
+    // belt band across the waist
+    const bY = V(0, 1.5, 0.6);
+    st([vadd(rowAt(rows[2], 0), bY), vadd(rowAt(rows[2], 0.5), bY), vadd(rowAt(rows[2], 1), bY)], 4.6, shade(MAT.coat, nMid, -0.18), { dry: 0.15, h: 0.5, w0: 0.9, tip: 0.9, noShadow: true });
+    st([vadd(rowAt(rows[2], 0), V(0, -0.8, 1)), vadd(rowAt(rows[2], 0.5), V(0, -0.8, 1)), vadd(rowAt(rows[2], 1), V(0, -0.8, 0.6))], 0.8, MAT.coat.d, { a: 0.7, dry: 0.3, noShadow: true });
+  // folds swinging with the skirt
+    for (const f of [0.2, 0.63]) {
+      st([gridAt(rows, 2.25, f), gridAt(rows, 3, f + 0.03 * sg), gridAt(rows, 3.95, f - 0.02)], [0.8, 2.2, 1.5], MAT.coat.d, { a: 0.75, dry: 0.5, w0: 0.3, tip: 0.5, noShadow: true });
+      st([gridAt(rows, 2.35, f + 0.07), gridAt(rows, 3.1, f + 0.1), gridAt(rows, 3.9, f + 0.08)], [0.6, 1.4, 1.0], shade(MAT.coat, V(-0.7, 0.4, 0.6)), { a: 0.6, dry: 0.55, w0: 0.3, tip: 0.5, noShadow: true });
+    }
+    // outer contour: shadowed side, lit side
+    const ctr = [rowAt(rows[0], 1), rowAt(rows[1], 1), rowAt(rows[2], 1), rowAt(rows[3], 1), rowAt(rows[4], 1)];
+    st(ctr.slice(1), [2.6, 3, 3, 2.4], sg > 0 ? shade(MAT.coat, V(0.8, 0, -0.2), -0.25) : shade(MAT.coat, V(-0.9, 0.3, 0.3), 0.06), { a: 0.85, dry: 0.45, noShadow: true });
+    st(ctr.slice(1).map(p => vadd(p, V(sg * 1.4, 0, 0))), 1.1, sg > 0 ? [0.64, 0.54, 0.95] : [1.0, 0.85, 0.6], { a: 0.55, dry: 0.55, noShadow: true, exact: true });
+    // front opening edge and hem
+    st([rowAt(rows[1], 0), rowAt(rows[2], 0), rowAt(rows[3], 0), rowAt(rows[4], 0)], [1.6, 2, 2, 1.8], shade(MAT.coat, V(-0.5, 0.6, 0.7), 0.1), { a: 0.9, dry: 0.3, noShadow: true });
+    st(rows[4], 2.8, MAT.coat.d, { dry: 0.3, a: 0.95 });
+    // slanted pocket welt and two buttons
+    st([gridAt(rows, 2.25, 0.42), gridAt(rows, 2.55, 0.8)], 1.3, MAT.coat.d, { a: 0.85, dry: 0.3, noShadow: true });
+    for (const r of [1.3, 1.7]) {
+      dab(gridAt(rows, r, 0.3), 1.9, 1.9, [0.17, 0.11, 0.09], { dry: 0.1, gloss: 0.7, noShadow: true });
+    }
+  }
+  // rim light catching the shoulder line (warm key on the left, violet on the right)
+  for (const sg of [-1, 1]) {
+    const sh = sg < 0 ? J.shM : J.shF;
+    const rim = sg < 0 ? [1.0, 0.86, 0.6] : [0.7, 0.6, 1.0];
+    st([xf(J.neck, J.Rc, sg * 9, 3.2, 0), xf(sh, J.Rc, sg * 3, 3.6, -0.5), xf(sh, J.Rc, sg * 7.2, 0.5, -1)], 1.2, rim, { a: 0.75, dry: 0.45, noShadow: true, exact: true });
+  }
+  // epaulettes / padded shoulders
+  for (const sg of [-1, 1]) {
+    const sh = sg < 0 ? J.shM : J.shF;
+    st([xf(J.neck, J.Rc, sg * 8, 1.5, 1), xf(sh, J.Rc, sg * 3.5, 2.5, 0.5)], 3.2, shade(MAT.coat, mv(J.Rc, V(sg * 0.3, 1, 0.5)), 0.05), { dry: 0.3, h: 0.5, noShadow: true });
+  }
+}
+
+function drawLapels(J) {
+  const Rc = J.Rc;
+  for (const sg of [-1, 1]) {
+    const top = xf(J.neck, Rc, sg * 5.8, 4, 5);
+    const notchIn = xf(J.chest, Rc, sg * 11.5, 9.5, 11.6);
+    const notch = xf(J.chest, Rc, sg * 15.8, 6, 11.4);
+    const brk = xf(J.chest, Rc, sg * 8.2, -21, 12.8);
+    const n = mv(Rc, vnorm(V(sg * 0.55, 0.35, 1)));
+    // collar leaf above the notch
+    st([xf(J.neck, Rc, sg * 3.5, 6.2, -3), xf(J.neck, Rc, sg * 8.5, 4.2, 2.2), notchIn], [2.8, 3.6, 3], shade(MAT.coat, mv(Rc, vnorm(V(sg * 0.6, 0.6, 0.6)))), { dry: 0.25, h: 0.5 });
+    // lapel body
+    st([top, vlerp(top, notch, 0.55), notch, vlerp(notch, brk, 0.45), brk], [3.2, 5, 5.2, 4.2, 1.4], shade(MAT.coat, n, 0.02), { dry: 0.22, h: 0.55, tip: 0.5 });
+    // roll line (lit) and the lapel's cast shadow
+    st([top, vadd(vlerp(top, brk, 0.5), mv(Rc, V(sg * 1.2, 0, 0.6))), brk], 1.5, shade(MAT.coat, V(-0.4, 0.7, 0.6), 0.12), { a: 0.9, dry: 0.3, noShadow: true });
+    st([vadd(notch, mv(Rc, V(sg * 1.3, -1.2, -0.5))), vadd(vlerp(notch, brk, 0.5), mv(Rc, V(sg * 1.8, 0, -0.5))), vadd(brk, mv(Rc, V(sg * 1.5, -2, 0)))], 1.8, MAT.coat.d, { a: 0.7, dry: 0.45, noShadow: true });
+    dab(vlerp(notch, notchIn, 0.5), 1.2, 1.8, MAT.coat.d, { a: 0.9, noShadow: true });
+  }
+}
+
+function drawArm(J, which) {
+  const M = which === 'M';
+  const sg = M ? -1 : 1;
+  const sh = M ? J.shM : J.shF, el = M ? J.elM : J.elF, wr = M ? J.wrM : J.wrF;
+  const up = vnorm(vsub(el, sh)), fo = vnorm(vsub(wr, el));
+  const top = xf(sh, J.Rc, sg * 2.5, 2.5, 0);
+  const cuff = vmad(wr, fo, -1.5);
+  const pU = perpToward(up, G.wDir), pF = perpToward(fo, G.wDir), pE = vnorm(vadd(pU, pF));
+  const nBase = vnorm(V(sg * 0.6, 0.15, 0.8));
+  st([top, el, cuff], [15.5, 14, 12.8], shade(MAT.coat, nBase), { dry: 0.22, h: 0.45, tip: 0.9, w0: 0.9 });
+  const nl = vnorm(vadd(pE, V(0, 0.2, 0.9)));
+  st([vmad(top, pU, 4.3), vmad(el, pE, 4.4), vmad(cuff, pF, 4)], [5.2, 5, 4.4], shade(MAT.coat, nl, 0.05), { a: 0.92, dry: 0.4, h: 0.5, noShadow: true });
+  const ns = vnorm(vadd(vmul(pE, -1), V(0, -0.1, 0.5)));
+  st([vmad(top, pU, -5), vmad(el, pE, -4.8), vmad(cuff, pF, -4.4)], [3.6, 4, 3.4], shade(MAT.coat, ns, -0.1), { a: 0.9, dry: 0.45, h: 0.45, noShadow: true });
+  st([vmad(el, up, -4), vmad(vmad(el, pE, -1.5), V(0, 0, 1), 3), vmad(el, fo, 3.5)], [0.6, 1.6, 0.6], MAT.coat.d, { a: 0.7, dry: 0.4, noShadow: true });
+  const rimSide = perpToward(vnorm(vadd(up, fo)), V(sg, 0, 0));
+  st([vmad(top, rimSide, 6.6), vmad(el, rimSide, 6.4), vmad(cuff, rimSide, 5.6)], 1.1, sg < 0 ? [1.0, 0.84, 0.58] : [0.68, 0.58, 1.0], { a: 0.6, dry: 0.5, noShadow: true, exact: true });
+  const cf = vmad(wr, fo, -4.5);
+  st([vmad(cf, pF, 6), vmad(vmad(cf, pF, 0), V(0, 0, 1), 2.5), vmad(cf, pF, -6)], 2.6, MAT.coat.d, { a: 0.9, dry: 0.25, noShadow: true });
+  if (M) {
+    drawSmear(SIM.trails.mic, [0.86, 0.87, 0.95], 9);
+    drawMic(J, 0);
+    drawHand(J, 'M');
+    drawMic(J, 1);
+  } else {
+    drawHand(J, 'F');
+  }
+}
+
+function drawHand(J, which) {
+  const M = which === 'M';
+  const ps = J.pose;
+  const el = M ? J.elM : J.elF, wr = M ? J.wrM : J.wrF;
+  const fore = vnorm(vsub(wr, el));
+  let dir = fore;
+  if (!M) dir = vnorm(vadd(fore, V(0, 0.25, 0.2)));
+  const lat = perpToward(dir, V(M ? -1 : 1, 0, 0));
+  const knuck = vmad(wr, dir, 8.2);
+  const cS = shade(MAT.skin, vnorm(V(M ? -0.4 : 0.3, 0.3, 0.9)));
+  const cL = shade(MAT.skin, vnorm(V(-0.6, 0.5, 0.7)), 0.04);
+  const open = M ? 0 : ps.fOpen * (1 - ps.fPoint);
+  // back of the hand / fist
+  st([vmad(wr, dir, 0.5), vmad(wr, dir, 4.8), knuck], [6.6, 8.2, 8.4 - open * 0.8], cS, { dry: 0.14, h: 0.45, w0: 0.9, tip: 0.85 });
+  if (open > 0.05) {
+    for (let i = 0; i < 4; i++) {
+      const o = (i - 1.5);
+      const base = vmad(knuck, lat, o * 1.9);
+      const fd = vnorm(vadd(dir, vmul(lat, o * 0.16 * open)));
+      const tip = vmad(vmad(base, fd, 1 + 6.2 * open), V(0, 0, 1), 0.6 * open);
+      st([vmad(base, fd, -1), tip], [2.0, 1.6], i === 0 ? cL : cS, { dry: 0.15, h: 0.4, tip: 0.7, w0: 0.9 });
+    }
+  } else {
+    st([vmad(knuck, lat, -3.8), vmad(vmad(knuck, V(0, 0, 1), 1.4), lat, 0), vmad(knuck, lat, 3.8)], 2.4, cL, { a: 0.85, dry: 0.3, noShadow: true });
+  }
+  if (!M && ps.fPoint > 0.05) {
+    const base = vmad(knuck, lat, -2.2);
+    st([vmad(base, dir, -1), vmad(base, dir, 1 + 7.5 * ps.fPoint)], [2.1, 1.7], cL, { dry: 0.12, h: 0.4, tip: 0.8, w0: 0.9 });
+  }
+  const th0 = vmad(vmad(wr, lat, -3.2), dir, 1.5);
+  st([th0, vmad(vmad(th0, dir, 4.2), lat, -1.2 - open * 1.5)], [2.5, 2.0], cS, { dry: 0.15, h: 0.4, tip: 0.8, w0: 0.9 });
+}
+
+function drawLasso(mf) {
+  if (mf.lasso < 0.02) return;
+  const mid = vadd(vlerp(mf.grip, mf.bottom, 0.5), V(0, -3 * mf.lasso, 0));
+  st([mf.grip, mid, mf.bottom], 1.7, [0.05, 0.05, 0.065], { c2: [0.32, 0.3, 0.38], dry: 0.1, h: 0.3, gloss: 0.8, w0: 1, tip: 1, tS: 0.01, tE: 0.01 });
+}
+function drawMic(J, stage) {
+  const mf = micFrame(J, SIM.mic.d);
+  const hdl = { s: [0.02, 0.02, 0.03], m: [0.07, 0.07, 0.08], l: [0.2, 0.18, 0.2], c: [0.18, 0.18, 0.36] };
+  if (stage === 0) {
+    drawLasso(mf);
+    const topH = vmad(mf.head, mf.d, -4.4);
+    st([mf.bottom, topH], [3.8, 5.2], shade(hdl, V(0, 0, 1)), { dry: 0.08, h: 0.35, gloss: 1, w0: 0.95, tip: 1 });
+    const p = perpToward(mf.d, G.wDir);
+    st([vmad(vmad(mf.bottom, p, 0.9), V(0, 0, 1), 1), vmad(vmad(topH, p, 1.3), V(0, 0, 1), 1)], 0.7, [0.55, 0.52, 0.56], { a: 0.75, dry: 0.3, noShadow: true });
+  } else {
+    const ang = screenAng(mf.bottom, mf.head);
+    dab(vmad(mf.head, mf.d, -3.8), 6, 2, MAT.chrome.s, { ang: ang + Math.PI / 2, dry: 0.1, gloss: 1 });
+    dab(mf.head, 8.4, 7.6, shade(MAT.chrome, V(0, 0.2, 1)), { ang, dry: 0.08, h: 0.6, gloss: 1 });
+    const p = perpToward(mf.d, G.wDir);
+    for (const k of [-2, 0, 2]) {
+      st([vmad(vmad(mf.head, mf.d, k), p, 3.7), vmad(vmad(vmad(mf.head, mf.d, k), p, 0), V(0, 0, 1), 3.9), vmad(vmad(mf.head, mf.d, k), p, -3.7)], 0.55, MAT.chrome.s, { a: 0.55, dry: 0.4, noShadow: true });
+    }
+    dab(vmad(vmad(mf.head, p, 2), mf.d, 1.6), 2.2, 2.2, MAT.chrome.l, { dry: 0.1, gloss: 1, noShadow: true });
+  }
+}
+
+function drawCable(micOff) {
+  const pts = SIM.cable.map((i, k) => micOff ? vmad(simGet(i), micOff, Math.max(0, 1 - k / 14)) : simGet(i));
+  st(pts, 1.9, [0.05, 0.05, 0.065], { c2: [0.32, 0.3, 0.38], dry: 0.12, h: 0.3, gloss: 0.8, w0: 1, tip: 1, tS: 0.01, tE: 0.01 });
+}
+
+function drawSmear(trail, col, w) {
+  if (G.mode === 'mask' || !trail || trail.length < 12) return;
+  const n = trail.length;
+  const speed = vlen(vsub(trail[n - 1], trail[n - 9])) / (8 * SIM.dt);
+  const a = smoothstep(330, 600, speed) * 0.5;
+  if (a < 0.03) return;
+  const pts = [];
+  for (let i = 0; i < n; i += 4) pts.push(trail[i]);
+  if ((n - 1) % 4) pts.push(trail[n - 1]);
+  st(pts, pts.map((_, i) => w * (0.12 + 0.88 * i / (pts.length - 1))), col, { a, dry: 0.7, w0: 0.3, tS: 0.3, tip: 0.85, tE: 0.05, h: 0.15, exact: true });
+}
+
+function drawHead(J) {
+  const H = J.head, R = J.Rh, ps = J.pose;
+  const hp = (x, y, z) => xf(H, R, x, y, z);
+  const hn = (x, y, z) => mv(R, vnorm(V(x, y, z)));
+  const skin = (x, y, z, j) => shade(MAT.skin, hn(x, y, z), j);
+  // block in the head in a darker skin tone first, so no gaps open between the planes
+  st([hp(0, 8.5, 4.5), hp(0, 1, 5.5), hp(0, -7, 5.5), hp(0, -10, 5)], [13.4, 14.6, 13, 8], skin(0.2, -0.1, 0.5, -0.18), { dry: 0.05, h: 0.3, w0: 0.9, tip: 0.8 });
+  // ears
+  for (const sg of [-1, 1]) {
+    st([hp(sg * 6.6, 5, 1.5), hp(sg * 7.0, 0, 1.2), hp(sg * 6.4, -5, 1.8)], [3.2, 3.6, 3], skin(sg, 0, 0.2, -0.12), { dry: 0.15, h: 0.35 });
+    st([hp(sg * 7.2, 2.4, -0.4), hp(sg * 7.7, -0.3, -0.3), hp(sg * 7.0, -3.4, 0.2)], [2.0, 2.5, 1.8], skin(sg, 0, 0.35, -0.05), { dry: 0.2, h: 0.4 });
+  }
+  // face mass, then the light and shadow planes
+  st([hp(0, 8.6, 7.6), hp(0, 3, 9.6), hp(0, -3, 9.8), hp(0, -8, 8.8), hp(0.1, -11.1, 7.2)], [12.2, 13.9, 13.2, 10.2, 5.4],
+    [skin(0, 0.5, 1), skin(0, 0.1, 1), skin(0, -0.1, 1), skin(0, -0.4, 1, -0.04), skin(0, -0.8, 0.6, -0.08)], { dry: 0.08, h: 0.35, w0: 0.9, tip: 0.8, c2: [0.86, 0.5, 0.42] });
+  st([hp(-3.7, 7.6, 8.2), hp(-4.7, 2, 8.6), hp(-4.4, -3.5, 8.4), hp(-3.1, -8, 7.8)], [4.4, 5, 4.6, 3.3],
+    [skin(-0.7, 0.4, 0.7, 0.05), skin(-0.8, 0, 0.6, 0.05), skin(-0.8, -0.2, 0.6, 0.03), skin(-0.6, -0.5, 0.6)], { dry: 0.2, h: 0.4 });
+  st([hp(5.6, 6.2, 6.4), hp(6.2, 1, 6.6), hp(5.7, -4.5, 6.0), hp(3.8, -8.8, 6.2)], [2.8, 3.2, 3.0, 2.3],
+    [skin(0.9, 0.2, 0.3, -0.1), skin(1, 0, 0.3, -0.12), skin(0.9, -0.2, 0.3, -0.12), skin(0.6, -0.6, 0.4, -0.1)], { a: 0.7, dry: 0.3, h: 0.4 });
+  st([hp(-3, 6.3, 9.2), hp(1.5, 6.7, 9.4)], 2.2, skin(-0.3, 0.6, 0.8, 0.08), { a: 0.7, dry: 0.4, noShadow: true });
+  for (const sg of [-1, 1]) {
+    dab(hp(sg * 4.3, -2.8, 8.5), 3.2, 3, [0.9, 0.46, 0.42], { kind: 1, a: 0.3, noShadow: true });
+    dab(hp(sg * 3.1, 1.3, 9.0), 3.2, 3.8, mixc(MAT.skin.s, MAT.skin.m, 0.45), { kind: 1, a: 0.45, ang: 0, noShadow: true });
+  }
+  // brows
+  const br = ps.brow * 0.8;
+  for (const sg of [-1, 1]) st([hp(sg * 1.3, 3.3 + br * 0.6, 9.8), hp(sg * 3.4, 3.95 + br, 9.6), hp(sg * 5.6, 3.3 + br * 0.5, 8.6)], [1.1, 1.3, 0.9], [0.4, 0.18, 0.11], { dry: 0.25, noShadow: true });
+  // eyes (free-side eye can wink)
+  for (const sg of [-1, 1]) {
+    const shut = clamp(ps.blink + (sg > 0 ? ps.wink : 0), 0, 1);
+    if (shut > 0.6) {
+      st([hp(sg * 1.9, 1.3, 9.4), hp(sg * 3.1, 0.8, 9.5), hp(sg * 4.4, 1.2, 9.0)], 0.6, [0.2, 0.1, 0.1], { dry: 0.2, noShadow: true });
+    } else {
+      st([hp(sg * 1.9, 1.2, 9.4), hp(sg * 3.1, 1.6 - shut, 9.45), hp(sg * 4.4, 1.15, 9.0)], 0.9, [0.15, 0.08, 0.08], { dry: 0.1, w0: 0.8, tip: 0.6, noShadow: true });
+      dab(hp(sg * 3.0, 0.85, 9.45), 1.2 * (1 - shut) + 0.2, 1.1, [0.19, 0.12, 0.12], { ang: 0, noShadow: true });
+      dab(hp(sg * 3.0 - 0.4, 1.2, 9.6), 0.4, 0.4, [0.95, 0.9, 0.88], { a: 0.75 * (1 - shut), noShadow: true });
+    }
+  }
+  // nose
+  st([hp(0.9, 2.2, 10.2), hp(1.3, -1.5, 11.0), hp(1.0, -3.3, 11.1)], [1.0, 1.25, 1.1], mixc(MAT.skin.s, MAT.skin.m, 0.35), { a: 0.75, dry: 0.3, noShadow: true });
+  dab(hp(-0.3, -2.6, 11.7), 1.6, 1.4, skin(-0.4, 0, 1, 0.08), { a: 0.8, noShadow: true });
+  dab(hp(0.2, -4.1, 10.9), 1.0, 2.4, [0.55, 0.3, 0.3], { a: 0.75, ang: 0, noShadow: true });
+  // mouth
+  const mo = ps.mouth, sm = ps.smile;
+  if (mo > 0.15) {
+    dab(hp(0, -6.9 - mo * 0.5, 9.7), 1.0 + mo * 2.0, 3.0, [0.2, 0.06, 0.08], { ang: 0, dry: 0.05, noShadow: true });
+    st([hp(-2.5, -5.9, 9.1), hp(0, -5.8, 10.0), hp(2.5, -5.9, 9.1)], 0.8, [0.7, 0.34, 0.32], { dry: 0.2, noShadow: true });
+    st([hp(-2.0, -7.5 - mo * 1.0, 9.2), hp(0, -8.0 - mo * 1.1, 9.7), hp(2.0, -7.5 - mo * 1.0, 9.2)], 1.0, [0.8, 0.44, 0.4], { dry: 0.2, noShadow: true });
+  } else if (sm > 0.8) {
+    // the grin: teeth between the lips, corners pulled up
+    const k = (sm - 0.8) / 0.2;
+    st([hp(-3.0, -5.7 + sm * 0.5, 8.9), hp(0, -6.35, 10.0), hp(3.0, -5.7 + sm * 0.5, 8.9)], 0.75, [0.42, 0.14, 0.15], { dry: 0.15, noShadow: true });
+    st([hp(-2.3, -6.1 + sm * 0.25, 9.3), hp(0, -6.75, 10.0), hp(2.3, -6.1 + sm * 0.25, 9.3)], 0.55 + 0.35 * k, [0.94, 0.9, 0.84], { dry: 0.2, noShadow: true, exact: true });
+    st([hp(-2.1, -6.6 + sm * 0.2, 9.3), hp(0, -7.25, 9.9), hp(2.1, -6.6 + sm * 0.2, 9.3)], 0.5, [0.35, 0.1, 0.12], { dry: 0.2, a: 0.8, noShadow: true });
+    st([hp(-1.6, -7.7, 9.5), hp(1.6, -7.7, 9.5)], 1.0, [0.82, 0.48, 0.44], { a: 0.7, dry: 0.3, noShadow: true });
+  } else {
+    st([hp(-2.8, -6.0 + sm * 0.7, 9.0), hp(0, -6.5, 10.0), hp(2.8, -6.0 + sm * 0.7, 9.0)], 0.8, [0.45, 0.15, 0.16], { dry: 0.15, noShadow: true });
+    st([hp(-1.5, -7.3, 9.5), hp(1.5, -7.3, 9.5)], 1.1, [0.82, 0.48, 0.44], { a: 0.75, dry: 0.3, noShadow: true });
+  }
+  dab(hp(-0.5, -9.6, 8.3), 2, 2.4, skin(-0.3, -0.5, 0.9, 0.06), { a: 0.5, noShadow: true });
+  drawHair(J);
+}
+
+function drawHair(J) {
+  const H = J.head, R = J.Rh;
+  let off = mvT(R, SIM.hair.off);
+  off = V(clamp(off.x * 1.6, -6, 6), clamp(off.y * 1.6, -6, 6), clamp(off.z * 1.6, -6, 6));
+  const hp = (x, y, z, k) => xf(H, R, x + off.x * k, y + off.y * k, z + off.z * k);
+  const hn = (x, y, z) => mv(R, vnorm(V(x, y, z)));
+  const hair = (x, y, z, j) => shade(MAT.hair, hn(x, y, z), j);
+  const crest = x => 15.8 - 0.085 * x * x;
+  // underpainted mound of the quiff, seen from the front: an arch plus a fill
+  const dark = mixc(MAT.hair.s, MAT.hair.m, 0.55);
+  st([hp(-7.2, 5.8, 5.8, 0), hp(-6.6, 10.8, 7.8, 0.4), hp(-3.8, 14.5, 8.4, 0.9), hp(0, 15.6, 8.6, 1), hp(3.8, 14.5, 8.4, 0.9), hp(6.6, 10.8, 7.8, 0.4), hp(7.2, 5.8, 5.8, 0)],
+    7, dark, { dry: 0.22, h: 0.4, w0: 0.9, tip: 0.9 });
+  st([hp(-5.8, 10.2, 9.4, 0.3), hp(0, 11.2, 10.4, 0.4), hp(5.8, 10.2, 9.4, 0.3)], 6.5, dark, { dry: 0.05, h: 0.4, w0: 0.9, tip: 0.9 });
+  // swept-back sides and sideburns
+  for (const sg of [-1, 1]) {
+    st([hp(sg * 6.6, 8.6, 5.8, 0.2), hp(sg * 7.8, 6.4, -1.5, 0.1), hp(sg * 7.4, 3, -7, 0)], [4, 3.8, 2.8], hair(sg, 0.3, 0.2, -0.1), { dry: 0.3, h: 0.5 });
+    st([hp(sg * 7.2, 4.5, 3, 0), hp(sg * 7.5, 1, 2.2, 0)], [1.8, 1.2], MAT.hair.s, { dry: 0.3, noShadow: true });
+  }
+  // the quiff: strands rise from the hairline and swirl over to one side as they roll over the crest
+  const sw = -3.0;
+  for (let i = 0; i < 9; i++) {
+    const x0 = -6.2 + i * 1.55, q = x0 * x0;
+    const r1 = hash(i * 7.3), r2 = hash(i * 3.1 + 1);
+    const xe = clamp(x0 + sw * 0.85, -6.9, 6.9);
+    const pk = crest(xe) + 0.4 * (r1 - 0.5);
+    const pts = [hp(x0, 7.3 + r2 * 0.6, 8.7 - 0.07 * q, 0), hp(x0 + sw * 0.25, 11.2, 10.6 - 0.06 * q, 0.35),
+                 hp(lerp(x0, xe, 0.7), pk - 1.1, 9.6 - 0.05 * q, 0.8), hp(xe, pk, 7.2 - 0.03 * q, 1)];
+    const j = (r1 - 0.5) * 0.18;
+    const cols = [hair(x0 * 0.06, -0.2, 1, j - 0.18), hair(x0 * 0.08, 0.1, 1, j - 0.05), hair(xe * 0.08, 0.6, 0.8, j + 0.05), hair(xe * 0.06, 1, 0.3, j + 0.08)];
+    const w = 0.8 + r2 * 0.45;
+    st(pts, [2.4 * w, 3.7 * w, 3.9 * w, 2.8 * w], cols, { dry: 0.3, h: 0.65, gloss: 0.45, tip: 0.5, c2: mixc(cols[2], [0.75, 0.3, 0.12], 0.4) });
+  }
+  // light catching the roll of the crest, a few loose highlight strands
+  st([hp(-6, crest(-6) - 1.8, 6.6, 0.8), hp(-3.2, crest(-3.2) - 0.3, 8.2, 0.95), hp(0, crest(0), 8.4, 1), hp(3.2, crest(3.2) - 0.4, 7.8, 0.95), hp(5.8, crest(5.8) - 1.9, 6.2, 0.8)],
+    [1.2, 1.9, 2.1, 1.7, 1.0], [MAT.hair.l, MAT.hair.l, mixc(MAT.hair.m, MAT.hair.l, 0.75), mixc(MAT.hair.m, MAT.hair.l, 0.5), MAT.hair.m], { a: 0.95, dry: 0.45, h: 0.6, gloss: 0.7, noShadow: true });
+  for (let i = 0; i < 4; i++) {
+    const x = -3.8 + i * 2.4, xe = clamp(x + sw * 0.85, -6.5, 6.5);
+    st([hp(x, 10.5, 10.7, 0.3), hp(lerp(x, xe, 0.6), crest(xe) - 1.2, 9.6, 0.8), hp(xe, crest(xe) - 0.2, 6.6, 1)], 0.9,
+      x < 0 ? MAT.hair.l : mixc(MAT.hair.m, MAT.hair.l, 0.45), { a: 0.8, dry: 0.5, h: 0.55, gloss: 0.6, noShadow: true });
+  }
+  for (const x of [-4.5, -1.2, 2.3, 5.2]) st([hp(x, 7.2, 9.0 - 0.06 * x * x, 0), hp(x - 0.6, 9.6, 10.0 - 0.06 * x * x, 0.2)], 0.9, MAT.hair.s, { a: 0.55, dry: 0.4, noShadow: true });
+}
+
+// ---------------------------------------------------------------- whole figure
+function armDepth(J, which) {
+  const el = which === 'M' ? J.elM : J.elF, wr = which === 'M' ? J.wrM : J.wrF;
+  const mid = vlerp(el, wr, 0.6);
+  return vdot(vsub(mid, J.chest), mv(J.Rc, V(0, 0, 1)));
+}
+
+function drawFigure(J) {
+  const C = coatGrid(J);
+  drawBackPanel(C);
+  drawLegs(J);
+  drawBelts(J);
+  drawTorso(J);
+  const mz = armDepth(J, 'M'), fz = armDepth(J, 'F');
+  if (mz < -3) drawArm(J, 'M');
+  if (fz < -3) drawArm(J, 'F');
+  drawFrontPanels(J, C);
+  drawLapels(J);
+  drawHead(J);
+  if (mz >= -3) drawArm(J, 'M');
+  if (fz >= -3) drawArm(J, 'F');
+  drawCable();
+}
+
+// simplified silhouette for the shadow masks. J may be an exaggerated, slightly
+// late copy of the pose; off / micOff move the simulated coat, belts and cable with it.
+function drawSilhouette(J, off, micOff) {
+  const C = coatGrid(J, off);
+  const flat = { sq: 0.6 };
+  for (const s of ['L', 'R']) {
+    const hip = J['hip' + s], an = J['an' + s], ft = J['foot' + s];
+    st([vadd(hip, V(0, 7, 0)), hip, J['kn' + s], an, vadd(vlerp(an, ft.ball, 0.4), V(0, -0.6, 1.5))], [18, 17, 14, 12.5, 12.5], null, flat);
+    st([vadd(an, V(0, -1.5, 0.5)), vadd(ft.ball, V(0, 2, 0)), ft.toe], [9, 10.5, 9], null);
+  }
+  for (const f of [0.1, 0.5, 0.9]) st([rowAt(C.B[0], f), rowAt(C.B[1], f), rowAt(C.B[2], f)], 17, null, flat);
+  for (const side of ['L', 'R']) {
+    const rows = C[side];
+    for (const f of [0.12, 0.5, 0.88]) st(rows.map(r => rowAt(r, f)), [11, 12, 12.5, 13.5, 14], null, flat);
+  }
+  st([J.chest, J.waist, J.pelvis], 30, null, flat);
+  st([xf(J.shM, J.Rc, -3, 1, 0), J.neck, xf(J.shF, J.Rc, 3, 1, 0)], 15, null);
+  st([J.chest, J.neck, J.neckTop, J.head], [18, 12, 11, 13], null);
+  for (const M of [true, false]) {
+    const sh = M ? J.shM : J.shF, el = M ? J.elM : J.elF, wr = M ? J.wrM : J.wrF;
+    st([sh, el, wr], [15, 13.5, 12], null);
+    const fo = vnorm(vsub(wr, el));
+    dab(vmad(wr, fo, 5), 9, 9, null, { ang: screenAng(wr, vmad(wr, fo, 8)) });
+  }
+  const mf = micFrame(J, SIM.mic.d);
+  st([mf.bottom, mf.head], [4, 5.4], null);
+  dab(mf.head, 8.6, 7.6, null);
+  if (mf.lasso > 0.02) st([mf.grip, mf.bottom], 1.8, null);
+  const H = J.head, R = J.Rh;
+  st([xf(H, R, 0, -11, 5), xf(H, R, 0, -2, 7), xf(H, R, 0, 8, 6), xf(H, R, -0.5, 15.5, 5)], [11, 15.5, 16, 13.5], null);
+  for (let s = 0; s < 2; s++) st(SIM.belts[s].map(i => off ? vadd(simGet(i), off) : simGet(i)), 4, null);
+  drawCable(micOff);
+}
+// ============================================================
+// Set, lights and camera: a brick railway arch at night, two swinging
+// stage lights (warm amber from the left, violet from the right).
+// ============================================================
+const WALL_Z = -150;
+const ARCH_R = 96, ARCH_SPRING = 138;
+const CAM_DIST = 560;
+const BRICKS = [[0.5, 0.27, 0.19], [0.44, 0.22, 0.17], [0.56, 0.33, 0.22], [0.38, 0.2, 0.17], [0.53, 0.38, 0.27], [0.33, 0.19, 0.18], [0.6, 0.31, 0.2]];
+
+function makeCam(pos, target, fovY, roll) {
+  const f = vnorm(vsub(target, pos));
+  const r = vnorm(vcross(f, V(0, 1, 0)));
+  const u = vcross(r, f);
+  const c = Math.cos(roll), s = Math.sin(roll);
+  return {
+    pos, f, r: vadd(vmul(r, c), vmul(u, s)), u: vsub(vmul(u, c), vmul(r, s)),
+    focal: (CH / 2) / Math.tan(fovY / 2), cx: CW / 2, cy: CH / 2
+  };
+}
+function project(cam, p) {
+  const dx = p.x - cam.pos.x, dy = p.y - cam.pos.y, dz = p.z - cam.pos.z;
+  const x = dx * cam.r.x + dy * cam.r.y + dz * cam.r.z;
+  const y = dx * cam.u.x + dy * cam.u.y + dz * cam.u.z;
+  const z = Math.max(1, dx * cam.f.x + dy * cam.f.y + dz * cam.f.z);
+  const s = cam.focal / z;
+  return { x: cam.cx + x * s, y: cam.cy - y * s, s };
+}
+// shadow of p cast by a point light onto the floor (y=0) or the back wall
+function shadowPoint(Lp, p) {
+  const d = vsub(p, Lp);
+  let tb = Infinity;
+  if (d.z < -1e-4) { const t = (WALL_Z + 0.5 - Lp.z) / d.z; if (t > 1) tb = t; }
+  if (d.y < -1e-4) { const t = (0.3 - Lp.y) / d.y; if (t > 1 && t < tb) tb = t; }
+  if (!isFinite(tb)) tb = 1;
+  return { p: vmad(Lp, d, tb), t: tb };
+}
+function projectShadow(cam, Lp, p, lean) {
+  const sp = shadowPoint(Lp, p);
+  if (lean && sp.p.y > 0.5) sp.p.x += lean * sp.p.y;   // pivot about the floor line
+  const q = project(cam, sp.p);
+  q.s *= sp.t;
+  return q;
+}
+
+const CAM_KEYS = [[0, 236, 104], [2, 250, 101], [9.4, 262, 100], [10.6, 206, 121], [13.5, 206, 121], [14.6, 274, 99], [21.6, 274, 99], [23.3, 234, 109], [26, 234, 109], [28, 236, 104]];
+function cameraAt(t, J) {
+  const b = t / BEAT;
+  let i = 0;
+  while (i + 1 < CAM_KEYS.length && b >= CAM_KEYS[i + 1][0]) i++;
+  const k0 = CAM_KEYS[i], k1 = CAM_KEYS[Math.min(i + 1, CAM_KEYS.length - 1)];
+  const u = k1[0] > k0[0] ? easeInOut(clamp((b - k0[0]) / (k1[0] - k0[0]), 0, 1)) : 0;
+  let viewH = lerp(k0[1], k1[1], u), ty = lerp(k0[2], k1[2], u);
+  if (!REDUCED) viewH *= 1 - 0.028 * Math.pow(dip(b), 2);
+  const asp = CW / CH;
+  if (asp < 1.1) { const need = 180 / asp; if (need > viewH) { ty += (need - viewH) * 0.12; viewH = need; } }
+  const tx = J.pelvis.x * 0.3;
+  const roll = REDUCED ? 0 : 0.017 * Math.sin(Math.PI * (b - 0.5));
+  const fov = 2 * Math.atan((viewH / 2) / CAM_DIST);
+  return makeCam(V(tx * 0.7, ty + 12, CAM_DIST), V(tx, ty, 0), fov, roll);
+}
+
+function lightsAt(b) {
+  const bigAmt = smoothstep(13.6, 14.3, b) * (1 - smoothstep(21.8, 22.4, b));
+  const amp = 70 + 50 * bigAmt;
+  const sw = Math.sin(Math.PI * (b - 0.5));
+  const dp = dip(b);
+  const bar = (((Math.round(b) % 4) + 4) % 4 === 0) ? 1 : 0;   // extra punch on each bar's downbeat
+  return {
+    w: V(-320 + amp * sw, 96 - 22 * dp, 320),
+    c: V(320 + amp * sw, 104 - 22 * dp, 320),
+    wI: 1 + (0.16 + 0.22 * bar) * dp, cI: 1 + (0.12 + 0.18 * bar) * dp
+  };
+}
+
+function insideArch(x, y, pad) {
+  const r = ARCH_R - (pad || 0);
+  if (Math.abs(x) > r) return false;
+  return y < ARCH_SPRING + Math.sqrt(Math.max(0, r * r - x * x));
+}
+
+// world-space stroke on the wall or floor, with its paint-on / lift-off delays
+function wst(pts, w, col, o, floor) {
+  const idx = G.buf.count;
+  const cx = (pts[0].x + pts[pts.length - 1].x) / 2;
+  const xf01 = clamp((cx + 300) / 600, 0, 1), hs = hash(idx * 7.13);
+  strokeWorld(pts, w, col, o || {}, floor ? V(0, 1, 0) : V(0, 0, 1), [0.45 * xf01 + 0.1 * hs - 0.05, 14.15 + 0.45 * xf01 + 0.1 * hs]);
+}
+function wdab(p, w, len, col, o) {
+  wst([V(p.x - len / 2, p.y, p.z), V(p.x + len / 2, p.y, p.z)], w, col, o);
+}
+
+// The set never moves, so it is built once and projected by the GPU each frame.
+function buildStaticBG() {
+  const rnd = mulberry(90210);
+  const W = WALL_Z;
+  // 0. dark underpainting of wall and floor, so gaps read as mortar and grime rather than holes
+  for (let y = 0; y < 480; y += 40) {
+    for (let x = -640; x < 640; x += 210) {
+      if (insideArch(x + 105, y + 10, 30)) continue;
+      wst([V(x, y + rnd() * 8, W - 0.2), V(x + 110, y + rnd() * 8, W - 0.2), V(x + 230, y + rnd() * 8, W - 0.2)], 52, [0.2 + rnd() * 0.05, 0.12, 0.1], { recv: 1, dry: 0.15, h: 0.12 });
+    }
+  }
+  for (let z = WALL_Z; z < 300; z += 24) {
+    for (let x = -720; x < 720; x += 260) wst([V(x, -0.1, z), V(x + 140, -0.1, z + (rnd() - 0.5) * 6), V(x + 290, -0.1, z)], 30, [0.15, 0.13, 0.17], { recv: 1, dry: 0.15, h: 0.1, gloss: 0.5 }, true);
+  }
+  // 1. broad wall strokes (mortar tone shows between later bricks)
+  for (let y = -6; y < 470; y += 21) {
+    let x = -600 + rnd() * 40;
+    while (x < 600) {
+      const len = 70 + rnd() * 110;
+      const c = BRICKS[(rnd() * BRICKS.length) | 0], k = 0.62 + rnd() * 0.25;
+      const y0 = y + rnd() * 4, y1 = y + (rnd() - 0.5) * 5, y2 = y + rnd() * 4;
+      if (!insideArch(x + len / 2, y, 8)) wst([V(x, y0, W), V(x + len / 2, y1, W), V(x + len, y2, W)], 25, scalec(c, k), { recv: 1, dry: 0.5, h: 0.28, sq: 0.55 });
+      x += len * (0.72 + rnd() * 0.2);
+    }
+  }
+  // 2. brick dabs in courses
+  for (let row = 0; row < 56; row++) {
+    const y = 3 + row * 8.6;
+    for (let x = -600 + (row % 2) * 11.5; x < 600; x += 23) {
+      const r1 = rnd(), r2 = rnd(), r3 = rnd(), r4 = rnd();
+      if (r1 > 0.46) continue;
+      if (insideArch(x, y, -34)) continue;
+      const c = BRICKS[(r2 * BRICKS.length) | 0];
+      const k = 0.8 + r3 * 0.4;
+      const hl = 7 + r4 * 3.5, dx = (r3 - 0.5) * 3;
+      wst([V(x + dx - hl, y + (r4 - 0.5) * 1.2, W + 0.2), V(x + dx + hl, y + (r3 - 0.5) * 1.2, W + 0.2)], 5.4 + r2 * 1.8, scalec(c, k), { recv: 1, dry: 0.3, h: 0.55, w0: 0.95, tip: 0.9, sq: 0.75, a: 0.75 + 0.25 * r1 / 0.46 });
+    }
+  }
+  // 3. grime
+  for (let i = 0; i < 16; i++) {
+    const x = -520 + rnd() * 1040, y0 = 330 + rnd() * 140, y1 = y0 - 90 - rnd() * 140;
+    if (Math.abs(x) < ARCH_R + 40) continue;
+    wst([V(x, y0, W + 0.3), V(x + (rnd() - 0.5) * 8, (y0 + y1) / 2, W + 0.3), V(x, y1, W + 0.3)], 10 + rnd() * 12, [0.12, 0.08, 0.09], { recv: 1, a: 0.28, dry: 0.7, w0: 0.9, tip: 0.2 });
+  }
+  // 4. the tunnel through the arch
+  for (let x = -ARCH_R + 4; x <= ARCH_R - 4; x += 12) {
+    const top = ARCH_SPRING + Math.sqrt(Math.max(0, ARCH_R * ARCH_R - x * x)) - 2;
+    const c = [0.045 + rnd() * 0.02, 0.05 + rnd() * 0.02, 0.09 + rnd() * 0.03];
+    wst([V(x, -2, W + 0.4), V(x + (rnd() - 0.5) * 4, top * 0.5, W + 0.4), V(x, top, W + 0.4)], 17, c, { recv: 0.12, dry: 0.3, h: 0.25, w0: 0.9, tip: 0.8 });
+  }
+  wdab(V(0, 70, W + 0.5), 140, 120, [0.05, 0.1, 0.19], { kind: 1, a: 0.28 });
+  // wet glints on the tunnel floor and a cold rim down each side of the opening
+  for (let i = 0; i < 9; i++) {
+    const x = -70 + rnd() * 140, y = 2 + rnd() * 14;
+    wst([V(x, y, W + 0.5), V(x + 10 + rnd() * 16, y + (rnd() - 0.5), W + 0.5)], 1.4, [0.2, 0.3, 0.42], { a: 0.35, dry: 0.5 });
+  }
+  for (const sg of [-1, 1]) wst([V(sg * (ARCH_R - 12), 4, W + 0.5), V(sg * (ARCH_R - 13), 70, W + 0.5), V(sg * (ARCH_R - 16), ARCH_SPRING + 30, W + 0.5)], 3, [0.14, 0.18, 0.3], { a: 0.35, dry: 0.6 });
+  // 5. arch reveal (soffit + jambs), then the voussoir rings
+  for (const sg of [-1, 1]) wst([V(sg * (ARCH_R - 5), -2, W + 0.8), V(sg * (ARCH_R - 5), ARCH_SPRING * 0.6, W + 0.8), V(sg * (ARCH_R - 5), ARCH_SPRING, W + 0.8)], 10, [0.3, 0.17, 0.15], { recv: 0.8, dry: 0.4, h: 0.4 });
+  {
+    const pts = [];
+    for (let a = 0; a <= Math.PI + 1e-6; a += Math.PI / 10) pts.push(V(Math.cos(a) * (ARCH_R - 5), ARCH_SPRING + Math.sin(a) * (ARCH_R - 5), W + 0.8));
+    wst(pts, 10, [0.3, 0.17, 0.15], { recv: 0.8, dry: 0.4, h: 0.4 });
+  }
+  for (let ring = 0; ring < 2; ring++) {
+    const r0 = ARCH_R + 1 + ring * 15, r1 = r0 + 13.5;
+    const n = 30 + ring * 3;
+    for (let i = 0; i <= n; i++) {
+      const a = (i + ring * 0.5) / n * Math.PI;
+      if (a > Math.PI) continue;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      const c = scalec([0.62, 0.44, 0.3], 0.8 + rnd() * 0.35);
+      wst([V(ca * r0, ARCH_SPRING + sa * r0, W + 1), V(ca * r1, ARCH_SPRING + sa * r1, W + 1)], 8.2, c, { recv: 1, dry: 0.3, h: 0.55, w0: 0.95, tip: 0.9, sq: 0.7 });
+    }
+  }
+  // 6. floor: wet cobbles
+  const F = [[0.3, 0.27, 0.31], [0.25, 0.23, 0.28], [0.35, 0.31, 0.33], [0.22, 0.2, 0.26]];
+  for (let z = WALL_Z; z < 300; z += 9) {
+    let x = -700 + rnd() * 60;
+    while (x < 700) {
+      const len = 80 + rnd() * 120;
+      const c = F[(rnd() * F.length) | 0];
+      wst([V(x, 0, z), V(x + len / 2, 0, z + (rnd() - 0.5) * 3), V(x + len, 0, z)], 12, c, { recv: 1, gloss: 0.7, dry: 0.4, h: 0.25 }, true);
+      x += len * (0.8 + rnd() * 0.15);
+    }
+  }
+  for (let z = WALL_Z + 20; z < 300; z += 34) wst([V(-700, 0.05, z), V(700, 0.05, z)], 1.6, [0.08, 0.07, 0.1], { recv: 0.6, a: 0.5, dry: 0.6 }, true);
+  for (let x = -660; x <= 660; x += 55) wst([V(x, 0.05, WALL_Z), V(x * 1.02, 0.05, 300)], 1.4, [0.08, 0.07, 0.1], { recv: 0.6, a: 0.45, dry: 0.6 }, true);
+  for (let i = 0; i < 22; i++) {
+    const x = -300 + rnd() * 600, z = -120 + rnd() * 330;
+    wst([V(x, 0.1, z), V(x + 25 + rnd() * 40, 0.1, z + (rnd() - 0.5) * 4)], 4, [0.62, 0.55, 0.6], { recv: 1, a: 0.5, gloss: 1, dry: 0.5 }, true);
+  }
+  wst([V(-700, 3, W + 2), V(0, 3, W + 2), V(700, 3, W + 2)], 7, [0.07, 0.05, 0.07], { recv: 0.3, dry: 0.35 });
+}
+
+// Per-frame parts of the set: rippling water in the tunnel, contact shadows under the feet.
+function drawDynamicBG(J) {
+  const W = WALL_Z;
+  for (let i = 0; i < 4; i++) {
+    const y = 14 + i * 4, w = 26 - i * 5;
+    const sh = Math.sin(G.t * 5 + i * 1.7) * 3;
+    st([V(-w / 2 + sh, y, W + 0.7), V(w / 2 + sh, y + 0.5, W + 0.7)], 1.2, i % 2 ? [0.45, 0.72, 0.7] : [0.3, 0.55, 0.57], { a: 0.35, dry: 0.5 });
+  }
+  const pl = J.pelvis;
+  dab(V(pl.x, 0.3, 4), 9, 78, [0.02, 0.015, 0.03], { kind: 1, a: 0.55, ang: 0, still: true });
+  for (const s of ['L', 'R']) {
+    const f = J['foot' + s];
+    const lift = f.ball.y - 1.5;
+    dab(V(f.ball.x, 0.3, f.ball.z - 3), 5, 26, [0.015, 0.01, 0.02], { kind: 1, a: 0.9 * (1 - clamp(lift / 12, 0, 0.8)), ang: 0, still: true });
+  }
+}
+
+function camVP(cam) {
+  const sx = 2 * cam.focal / CW, sy = 2 * cam.focal / CH;
+  const r = cam.r, u = cam.u, f = cam.f, p = cam.pos;
+  const tr = -vdot(r, p), tu = -vdot(u, p), tf = -vdot(f, p);
+  return new Float32Array([
+    sx * r.x, sy * u.x, 0.5 * f.x, f.x,
+    sx * r.y, sy * u.y, 0.5 * f.y, f.y,
+    sx * r.z, sy * u.z, 0.5 * f.z, f.z,
+    sx * tr, sy * tu, 0.5 * tf, tf
+  ]);
+}
+// ============================================================
+// Frame orchestration
+// ============================================================
+const bufBGs = new StrokeBuf(true), bufBGd = new StrokeBuf(), bufSH = new StrokeBuf(), bufFG = new StrokeBuf();
+let staticBuilt = false;
+
+// Paint-on at the start, strokes lifting away at the end: each stroke gets two
+// delays (seconds); the fragment shader clips the stroke to the painted part.
+G.rev = (idx, x) => {
+  const hs = hash(idx * 7.13 + (G.layer === 'bg' ? 0 : G.layer === 'sh' ? 50 : 100));
+  const xf01 = clamp(x / CW, 0, 1);
+  let dIn;
+  if (G.layer === 'bg') dIn = 0.45 * xf01 + 0.1 * hs - 0.05;
+  else if (G.layer === 'sh') dIn = 0.6 + 0.25 * hs;
+  else dIn = 0.18 + 0.75 * (idx / Math.max(1, G.fgCount)) + 0.05 * hs;
+  return [dIn, 14.15 + 0.45 * xf01 + 0.1 * hs];
+};
+
+const STATS = { frames: 0, lastMs: 0, strokes: 0, verts: 0 };
+
+function renderFrame(tAbs) {
+  const t0 = performance.now();
+  glResize();
+  const t = modT(tAbs);
+  simAdvance(tAbs);
+  G.t = t; G.b = t / BEAT;
+  const J = solveRig(danceAt(t));
+  const cam = cameraAt(t, J);
+  G.cam = cam;
+  const Ls = lightsAt(G.b);
+  G.wDir = vnorm(V(Ls.w.x - J.chest.x, 90, Ls.w.z - J.chest.z));
+  G.cDir = vnorm(V(Ls.c.x - J.chest.x, 50, Ls.c.z - J.chest.z));
+  G.wI = Ls.wI; G.cI = Ls.cI;
+  const camProj = p => project(cam, p);
+  // squash on the beat, stretch on the rebound (about the feet)
+  const sqz = J.pose.squash * (dip(G.b) - 0.25);
+  const sx = 1 + sqz * 0.7, sy = 1 - sqz, bx = J.pelvis.x, bz = J.pelvis.z;
+  const squash = p => V(bx + (p.x - bx) * sx, p.y * sy, bz + (p.z - bz) * sx);
+  const figProj = p => project(cam, squash(p));
+
+  // background: static set (built once, projected on the GPU) + a few moving strokes
+  G.mode = 'paint'; G.layer = 'bg';
+  if (!staticBuilt) { G.buf = bufBGs; bufBGs.reset(); buildStaticBG(); staticBuilt = true; }
+  G.buf = bufBGd; bufBGd.reset(); G.proj = camProj; G.boil = Math.floor(t * 6); G.jit = 0.5;
+  drawDynamicBG(J);
+  // shadow masks for both lights. The shadows dance a touch late and bigger than the man.
+  const J2 = solveRig(lerpPose(basePose(), danceAt(modT(t - 0.1 * BEAT)), 1.4));
+  const sOff = vsub(J2.pelvis, J.pelvis);
+  const mOff = vsub(micFrame(J2, SIM.mic.d).bottom, micFrame(J, SIM.mic.d).bottom);
+  G.buf = bufSH; bufSH.reset(); G.mode = 'mask'; G.layer = 'sh'; G.boil = Math.floor(t * (REDUCED ? 4 : 12));
+  // ... and they sway on the wall like pendulums, a little behind the beat
+  const lean = (REDUCED ? 0.05 : 0.13) * sideHit(G.b, 0.2, 0.3, 0.45, 1.8);
+  // depth is flattened so each shadow reads as the dancer's front-on pose (a shadow-puppet cheat)
+  const z0 = J2.pelvis.z, flat = p => squash(V(p.x, p.y, z0 + (p.z - z0) * 0.4));
+  G.maskCol = [1, 0, 0]; G.proj = p => projectShadow(cam, Ls.w, flat(p), lean); drawSilhouette(J2, sOff, mOff);
+  G.maskCol = [0, 1, 0]; G.proj = p => projectShadow(cam, Ls.c, flat(p), lean); drawSilhouette(J2, sOff, mOff);
+  // the dancer
+  G.buf = bufFG; bufFG.reset(); G.mode = 'paint'; G.layer = 'fg'; G.proj = figProj;
+  G.boil = Math.floor(t * (REDUCED ? 4 : 12)); G.jit = REDUCED ? 0.35 : 0.7;
+  drawFigure(J);
+  G.fgCount = bufFG.count;
+
+  glDrawStrokes(bufBGs, T_BG, { world: true, vp: camVP(cam), boil: Math.floor(t * (REDUCED ? 2 : 6)), jit: 0.6, time: t });
+  glDrawStrokes(bufBGd, T_BG, { noClear: true, time: t });
+  glDrawStrokes(bufSH, T_SH, { mask: true, time: t });
+  glDrawStrokes(bufFG, T_FG, { time: t });
+
+  // light pools in GL pixel coordinates (y up)
+  const pool = (Lp, worldR, floorX) => {
+    const c = shadowPoint(Lp, J.chest).p;
+    const q = project(cam, c);
+    const r = worldR * q.s;
+    const f = project(cam, V(floorX, 0, 40));
+    return [[q.x, CH - q.y, r * 1.2, r], [f.x, CH - f.y, 250 * f.s, 70 * f.s]];
+  };
+  const pw = pool(Ls.w, 170, Ls.w.x * 0.18), pc = pool(Ls.c, 160, Ls.c.x * 0.18);
+  glComposite({
+    amb: [0.2, 0.19, 0.33],
+    wCol: [1.32 * Ls.wI, 0.84 * Ls.wI, 0.5 * Ls.wI],
+    cCol: [0.62 * Ls.cI, 0.45 * Ls.cI, 1.18 * Ls.cI],
+    wPool: pw[0], wPool2: pw[1], cPool: pc[0], cPool2: pc[1],
+    grain: (Math.floor(t * 12) % 61) * 1.37,
+    relief: 2.1,
+    floorY: CH - project(cam, V(J.pelvis.x, 0, 2)).y,
+    time: t
+  });
+  STATS.frames++;
+  STATS.lastMs = performance.now() - t0;
+  STATS.strokes = bufBGs.count + bufBGd.count + bufSH.count + bufFG.count;
+  STATS.verts = bufBGs.nv + bufBGd.nv + bufSH.nv + bufFG.nv;
+}
+
+const QS = new URLSearchParams(location.search);
+const FIXED_T = QS.has('t') ? parseFloat(QS.get('t')) : null;
+let startMs = null, errors = 0, paused = false, pausedAt = 0;
+function tick(now) {
+  if (paused) return;
+  if (startMs === null) startMs = now;
+  try { renderFrame((now - startMs) / 1000); }
+  catch (e) { if (errors++ < 3) console.error(e); }
+  requestAnimationFrame(tick);
+}
+// test hooks (no visible UI): render a given time, read stats, pause/resume the clock
+window.__rick = {
+  render: t => { renderFrame(t); return STATS; },
+  stats: () => STATS,
+  pause: () => { if (!paused) { paused = true; pausedAt = performance.now(); } },
+  resume: () => { if (paused) { paused = false; if (startMs !== null) startMs += performance.now() - pausedAt; requestAnimationFrame(tick); } }
+};
+if (FIXED_T !== null && isFinite(FIXED_T)) renderFrame(FIXED_T);
+else requestAnimationFrame(tick);
+</script>
+</body>
+</html>
