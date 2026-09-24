@@ -1,3 +1,7 @@
+> **This fork** adds a from-scratch recreation of the piece in [`recreation/`](recreation/), written from this README and the
+> 15-second reference only, without opening `index.html` or `src/`. Open `recreation/index.html` to watch it, and see
+> [recreation/README.md](recreation/README.md) for how it is made.
+
 # Nocturne in Blue and Gold: the painted Rickroll
 
 A moving oil painting with its own soundtrack, about a minute long (30 bars at 112 BPM, ≈64 s, looping).
