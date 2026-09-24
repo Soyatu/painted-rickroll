@@ -127,10 +127,10 @@ function drawVisitor(b, t) {
   // HA! HA! painted in the air, rising off them and fading
   if (laugh > 0.1) for (let i = 0; i < 3; i++) {
     const ph = fract(t * 0.9 + i / 3);
-    const cap = 5.5 + 2 * hash(i * 3.1 + Math.floor(t * 0.9 + i / 3));
+    const cap = 8 + 2.5 * hash(i * 3.1 + Math.floor(t * 0.9 + i / 3));
     const lay = layoutText('HA!', 1.4, 0.12);
     const o = vadd(head, V(16 + ph * 22 + (i - 1) * 9, 8 + ph * 38, 6));
-    for (const line of lay.lines) st(line.map(([px, py]) => vadd(o, V(px * cap / 6, py * cap / 6, 0))), cap * 0.17, [0.24, 0.22, 0.26],
+    for (const line of lay.lines) st(line.map(([px, py]) => vadd(o, V(px * cap / 6, py * cap / 6, 0))), cap * 0.19, [0.16, 0.14, 0.18],
       { a: laugh * sstep(0, 0.1, ph) * (1 - sstep(0.6, 1, ph)), dry: 0.2, w0: 1, tip: 1, exact: true });
   }
 }

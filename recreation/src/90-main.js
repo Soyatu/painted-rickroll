@@ -25,7 +25,7 @@ function renderFrame(tAbs, overlayTime) {
   G.boil = Math.floor(t * 12); G.jit = 0.6;
   if (plan.overlay) plan.overlay(b, t);
   const ot = overlayTime !== undefined ? overlayTime : t;
-  if (APP.mode === 'title' || (APP.startedAt !== null && overlayTime !== undefined)) drawTitle(ot);
+  if (overlayTime !== undefined) drawTitle(ot);
   glDrawStrokes(bufOV, T.OV, { time: ot });
   const F = Object.assign({ time: t, grain: (Math.floor(t * 12) % 61) * 1.37 }, plan.final || {});
   F.p4 = [plan.overlayShadow !== undefined ? plan.overlayShadow : 0.8, (plan.final && plan.final.pickB) || 0, 0, 0];
@@ -84,7 +84,7 @@ function tick() {
   try {
     // on the title card the opening frame holds still while the river shimmers under the lettering
     if (APP.mode === 'title') renderFrame(0, titleTime());
-    else renderFrame(pieceTime(), APP.startedAt !== null ? titleTime() : undefined);
+    else renderFrame(pieceTime(), APP.startedAt !== null && titleTime() - APP.startedAt < 2 ? titleTime() : undefined);
   } catch (e) { if (APP.errors++ < 3) console.error(e); }
   requestAnimationFrame(tick);
 }

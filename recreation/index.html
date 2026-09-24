@@ -610,8 +610,13 @@ void main(){
   }
   // overlay strokes (title card, palette knife, closing curtains), lit as impasto with a drop shadow
   vec4 ov = texture(u_ovC, uv);
-  vec4 ovS = texture(u_ovC, uv + vec2(-6.0, 9.0) * u_dpr / u_res);
-  col *= 1.0 - 0.45 * ovS.a * u_p4.x;
+  // a soft cast shadow, a few pixels down and to the left
+  float shA = 0.0;
+  for (int i = 0; i < 4; i++) {
+    vec2 j = vec2(float(i % 2), float(i / 2)) - 0.5;
+    shA += texture(u_ovC, uv + (vec2(-3.0, 4.5) * (1.0 + 0.35 * float(i)) + j * 2.5) * u_dpr / u_res).a;
+  }
+  col *= 1.0 - 0.4 * shA * 0.25 * u_p4.x;
   if (ov.a > 0.002) {
     vec2 px = u_dpr / u_res;
     float hl = texture(u_ovH, uv - vec2(px.x, 0.0)).r, hr = texture(u_ovH, uv + vec2(px.x, 0.0)).r;
@@ -1588,7 +1593,7 @@ function mvPopFreeze(b, P) {
     const Q = pose0();
     Q.x = 8; Q.y = -4; Q.roll = 0.14; Q.yaw = 0.25; Q.croll = -0.16; Q.cyaw = -0.1; Q.cpitch = 0.02;
     Q.hroll = 0.2; Q.hyaw = -0.12; Q.hpitch = -0.04;
-    Q.mx = -18; Q.my = 16; Q.mz = 18; Q.mPole = 0.2;
+    Q.mx = -26; Q.my = 0; Q.mz = 20; Q.mPole = 0.2;
     Q.fx = 25; Q.fy = -26; Q.fz = 8; Q.fHip = 1; Q.fOpen = 0;
     Q.lfx = -24; Q.lfz = 6; Q.lheel = 9; Q.lfyaw = -0.5; Q.rfx = 12; Q.rfz = -2; Q.lkx = 0.9; Q.rkx = 0.4;
     Q.smile = 1; Q.brow = 0.9 * bump(b, 55.2, 0.3) + 0.3;
@@ -3576,11 +3581,11 @@ const S_STAR = {
   camera(b, t, J) {
     const kick = REDUCED ? 0 : hitEnv('kick', t, 0.12);
     const breathe = Math.sin((b - 72) / 16 * Math.PI) * 0.05;
-    const viewH = 330 * (1 - breathe) * (1 - 0.025 * kick);
+    const viewH = 345 * (1 - breathe) * (1 - 0.025 * kick);
     const tx = J.pelvis.x * 0.3;
     // the ta-da: a push in, and hold
     const tada = easeOut((b - 100) / 1.2, 3) * 0.16;
-    return makeCam(V(tx, 150, 640), V(tx, 215 - 70 * tada, -300), 2 * Math.atan((viewH * (1 - tada) / 2) / 640), 0);
+    return makeCam(V(tx, 150, 640), V(tx, 195 - 50 * tada, -300), 2 * Math.atan((viewH * (1 - tada) / 2) / 640), 0);
   },
   lights(b, t, J, cam) {
     const hat = hitEnv('hat', t, 0.1), crash = hitEnv('crash', t, 0.6);
@@ -4022,10 +4027,10 @@ function drawVisitor(b, t) {
   // HA! HA! painted in the air, rising off them and fading
   if (laugh > 0.1) for (let i = 0; i < 3; i++) {
     const ph = fract(t * 0.9 + i / 3);
-    const cap = 5.5 + 2 * hash(i * 3.1 + Math.floor(t * 0.9 + i / 3));
+    const cap = 8 + 2.5 * hash(i * 3.1 + Math.floor(t * 0.9 + i / 3));
     const lay = layoutText('HA!', 1.4, 0.12);
     const o = vadd(head, V(16 + ph * 22 + (i - 1) * 9, 8 + ph * 38, 6));
-    for (const line of lay.lines) st(line.map(([px, py]) => vadd(o, V(px * cap / 6, py * cap / 6, 0))), cap * 0.17, [0.24, 0.22, 0.26],
+    for (const line of lay.lines) st(line.map(([px, py]) => vadd(o, V(px * cap / 6, py * cap / 6, 0))), cap * 0.19, [0.16, 0.14, 0.18],
       { a: laugh * sstep(0, 0.1, ph) * (1 - sstep(0.6, 1, ph)), dry: 0.2, w0: 1, tip: 1, exact: true });
   }
 }
@@ -4905,7 +4910,7 @@ function renderFrame(tAbs, overlayTime) {
   G.boil = Math.floor(t * 12); G.jit = 0.6;
   if (plan.overlay) plan.overlay(b, t);
   const ot = overlayTime !== undefined ? overlayTime : t;
-  if (APP.mode === 'title' || (APP.startedAt !== null && overlayTime !== undefined)) drawTitle(ot);
+  if (overlayTime !== undefined) drawTitle(ot);
   glDrawStrokes(bufOV, T.OV, { time: ot });
   const F = Object.assign({ time: t, grain: (Math.floor(t * 12) % 61) * 1.37 }, plan.final || {});
   F.p4 = [plan.overlayShadow !== undefined ? plan.overlayShadow : 0.8, (plan.final && plan.final.pickB) || 0, 0, 0];
@@ -4964,7 +4969,7 @@ function tick() {
   try {
     // on the title card the opening frame holds still while the river shimmers under the lettering
     if (APP.mode === 'title') renderFrame(0, titleTime());
-    else renderFrame(pieceTime(), APP.startedAt !== null ? titleTime() : undefined);
+    else renderFrame(pieceTime(), APP.startedAt !== null && titleTime() - APP.startedAt < 2 ? titleTime() : undefined);
   } catch (e) { if (APP.errors++ < 3) console.error(e); }
   requestAnimationFrame(tick);
 }

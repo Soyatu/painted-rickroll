@@ -428,8 +428,13 @@ void main(){
   }
   // overlay strokes (title card, palette knife, closing curtains), lit as impasto with a drop shadow
   vec4 ov = texture(u_ovC, uv);
-  vec4 ovS = texture(u_ovC, uv + vec2(-6.0, 9.0) * u_dpr / u_res);
-  col *= 1.0 - 0.45 * ovS.a * u_p4.x;
+  // a soft cast shadow, a few pixels down and to the left
+  float shA = 0.0;
+  for (int i = 0; i < 4; i++) {
+    vec2 j = vec2(float(i % 2), float(i / 2)) - 0.5;
+    shA += texture(u_ovC, uv + (vec2(-3.0, 4.5) * (1.0 + 0.35 * float(i)) + j * 2.5) * u_dpr / u_res).a;
+  }
+  col *= 1.0 - 0.4 * shA * 0.25 * u_p4.x;
   if (ov.a > 0.002) {
     vec2 px = u_dpr / u_res;
     float hl = texture(u_ovH, uv - vec2(px.x, 0.0)).r, hr = texture(u_ovH, uv + vec2(px.x, 0.0)).r;

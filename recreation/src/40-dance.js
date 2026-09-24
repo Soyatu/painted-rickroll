@@ -211,7 +211,7 @@ function mvPopFreeze(b, P) {
     const Q = pose0();
     Q.x = 8; Q.y = -4; Q.roll = 0.14; Q.yaw = 0.25; Q.croll = -0.16; Q.cyaw = -0.1; Q.cpitch = 0.02;
     Q.hroll = 0.2; Q.hyaw = -0.12; Q.hpitch = -0.04;
-    Q.mx = -18; Q.my = 16; Q.mz = 18; Q.mPole = 0.2;
+    Q.mx = -26; Q.my = 0; Q.mz = 20; Q.mPole = 0.2;
     Q.fx = 25; Q.fy = -26; Q.fz = 8; Q.fHip = 1; Q.fOpen = 0;
     Q.lfx = -24; Q.lfz = 6; Q.lheel = 9; Q.lfyaw = -0.5; Q.rfx = 12; Q.rfz = -2; Q.lkx = 0.9; Q.rkx = 0.4;
     Q.smile = 1; Q.brow = 0.9 * bump(b, 55.2, 0.3) + 0.3;

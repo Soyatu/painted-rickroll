@@ -180,11 +180,11 @@ const S_STAR = {
   camera(b, t, J) {
     const kick = REDUCED ? 0 : hitEnv('kick', t, 0.12);
     const breathe = Math.sin((b - 72) / 16 * Math.PI) * 0.05;
-    const viewH = 330 * (1 - breathe) * (1 - 0.025 * kick);
+    const viewH = 345 * (1 - breathe) * (1 - 0.025 * kick);
     const tx = J.pelvis.x * 0.3;
     // the ta-da: a push in, and hold
     const tada = easeOut((b - 100) / 1.2, 3) * 0.16;
-    return makeCam(V(tx, 150, 640), V(tx, 215 - 70 * tada, -300), 2 * Math.atan((viewH * (1 - tada) / 2) / 640), 0);
+    return makeCam(V(tx, 150, 640), V(tx, 195 - 50 * tada, -300), 2 * Math.atan((viewH * (1 - tada) / 2) / 640), 0);
   },
   lights(b, t, J, cam) {
     const hat = hitEnv('hat', t, 0.1), crash = hitEnv('crash', t, 0.6);

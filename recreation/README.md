@@ -4,9 +4,11 @@ A second, independent build of the painted Rickroll in this repository: a moving
 synthesised soundtrack, 30 bars at 112 BPM (about 64 s, looping), drawn entirely in code with WebGL2 and WebAudio.
 
 It was written from the brief in the top-level `README.md` and the 15-second generation in
-`reference/original-15s.html`, **without opening the original `index.html` or its `src/`**. The stroke renderer and
-the impasto lighting follow the approach of that 15-second reference. Everything else, including the four new
-worlds, the transitions, the choreography, the physics and the entire score, was written fresh for this version.
+`reference/original-15s.html`, **without opening the original `index.html`, its `src/` or `PROMPT.md`**. The
+stroke renderer, the impasto lighting and parts of the dancer (the rig's proportions, the layout of the face and
+quiff, the coat and cable simulation) follow the approach of that 15-second reference. The rest was written fresh
+for this version: the river nocturne, the pop-art prints, the theatre, the starry night and the gallery, all the
+transitions, the new choreography, the rotation-aware figure painting and the entire score.
 
 ## Watch it
 
